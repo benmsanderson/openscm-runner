@@ -161,24 +161,77 @@ deprecate the old one only after the new one is shipped and used.
 ## Core changes for native calibration passthrough
 
 The current `cfgs: list[dict]` represents one runner-translated ensemble member per dict.
-Native passthrough means letting the user hand the adapter the model's own calibration object
-(FaIR 2.x xarray netCDF, CICERO-SCM JSON list-of-dicts with `pamset_udm` / `pamset_emiconc` /
-`pamset_carbon` / `Index`) without runner translation.
+Native passthrough means letting the user hand the adapter the model's own calibration
+package, and letting the model's own ensemble API run it, without the runner translating.
+This is an alternative path alongside the translated-cfg path (non-breaking change), but
+in practice will be the path serious users take.
 
-Recommended approach (additive, mirrors how `output_config` was added):
+**Shape of "native calibration" per model.** Worth being explicit, since they are not the
+same kind of artefact:
 
-- Add an optional kwarg to `_Adapter._run` (e.g. `native_calibration=None`) and thread it
-  through `run.run`. Adapters that don't support it should ignore it or raise
-  `NotImplementedError` (the precedent set by `output_config` in
-  [fair_adapter.py:54](src/openscm_runner/adapters/fair_adapter/fair_adapter.py#L54) and
-  the CICERO adapters).
-- For each new adapter (FaIR 2.x, CSCM-Py modernised), implement `native_calibration` as
-  either a file path or an in-memory object; when supplied, bypass the per-cfg translation
-  path and call the model with its native ensemble API
-  (`fair.fill_from_csv` / xarray Dataset for FaIR 2.x; `DistributionRun(ConfigDistro(...))`
-  for CSCM-Py).
-- Keep the existing translated-cfg path working for backwards compatibility (existing
-  downstream users like climate-assessment will continue to call it).
+- **FaIR 2.x** (e.g. https://zenodo.org/records/18828694): a *directory bundle* of CSVs,
+  not a single netCDF. Contains a parameter posterior
+  (`calibrated_constrained_parameters.csv`, 841 members for the AR7 reference
+  calibration), a per-species config (`species_configs_properties.csv`), historical
+  emissions (`historical_emissions_1750-2023_cmip7.csv`), CMIP7-aligned natural forcings
+  (`solar_forcing_timebounds_cmip7.csv`, `volcanic_forcing_timebounds_cmip7.csv`), and
+  several scale-factor / lifetime files. Parameters, species configs and natural forcings
+  are jointly tuned in the calibration, so all of them have to come from the same bundle.
+  Important consequence: the bundled solar/volcanic CSV in the FaIR 1.6 adapter
+  ([natural-emissions-and-forcing.csv](src/openscm_runner/adapters/fair_adapter/natural-emissions-and-forcing.csv))
+  is for FaIR 1.6 only. The FaIR 2.x adapter in native-calibration mode reads natural
+  forcings from the calibration bundle.
+- **CICERO-SCM v2.x**: a JSON list-of-dicts (each entry has `pamset_udm`, `pamset_emiconc`,
+  `pamset_carbon`, `Index`), as produced by the v2.x calibration pipeline.
+- **MAGICC7**: not in scope for v1.
+
+**Public API (additive, sidecar in the per-model cfg list):**
+
+The calibration ref and subsetting live as sidecar keys inside the cfg dict already
+accepted by `climate_models_cfgs`, rather than as a new top-level kwarg on `run.run`.
+That keeps the public signature change to zero and lets a user mix a native-calibration
+entry with other entries in the same model's cfg list. Concretely:
+
+```python
+run(
+    climate_models_cfgs={
+        "FaIRv2": [
+            {
+                "native_calibration": "/path/to/fair2-ar7-bundle/",
+                "member_indices": range(600),  # optional, default = all members
+            },
+        ],
+        "CICEROSCMPY2": [
+            {
+                "native_calibration": "/path/to/cscm-cal.json",  # or a Python list[dict]
+            },
+        ],
+    },
+    scenarios=...,
+    output_variables=...,
+)
+```
+
+- For each new adapter (FaIR 2.x, CSCM-Py v2.x), the adapter inspects each cfg dict for a
+  `native_calibration` key. If present, it bypasses the per-cfg translation path and calls
+  the model's own ensemble API (`fair.FAIR().fill_from_csv(...)` / xarray batching for
+  FaIR 2.x; `DistributionRun(ConfigDistro(...))` for CSCM-Py).
+- `native_calibration` accepts either a filesystem path or an already-loaded in-memory
+  object. For FaIR 2.x: a directory path or a `Calibration` wrapper. For CSCM-Py: a JSON
+  file path or a Python `list[dict]` (each dict carrying `pamset_udm`, `pamset_emiconc`,
+  `pamset_carbon`, `Index`).
+- **Ensemble subsetting** via a companion sidecar key `member_indices` (default omitted /
+  `None` means "all members in the bundle"; a sequence of `int` selects by zero-based
+  index into the bundle's member axis). "First N members" is `range(N)`, so we don't need
+  a separate kwarg for it. Constraint-based filtering belongs upstream of the bundle we
+  receive.
+- Adapters that don't recognise `native_calibration` should raise `NotImplementedError`
+  (the precedent set by `output_config` in
+  [fair_adapter.py:54](src/openscm_runner/adapters/fair_adapter/fair_adapter.py#L54)).
+
+**Backwards compatibility.** The translated-cfg path stays for existing users
+(climate-assessment, anyone calling the FaIR 1.6 / Fortran CSCM / MAGICC7 adapters today).
+Native calibration is opt-in via the new kwarg.
 
 ## Core changes for concentration-driven runs and flexible start dates
 
