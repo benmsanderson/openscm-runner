@@ -265,8 +265,13 @@ should land before or alongside the adapter work, not after.
   serially, so on a 100-core allocation with four SCMs three are idle at any moment.
   Fix: top-level `ProcessPoolExecutor` across models (processes, not threads, for
   consistency with what every adapter already does internally and to avoid GIL surprises
-  from adapters that don't reliably release it), with an optional sequential fallback for
-  debugging. One small PR, unblocks multi-SCM ensembles.
+  from adapters that don't reliably release it). Two new kwargs on `run.run`:
+  `parallel_models: bool = True` (default on, since cluster-usability is the whole
+  motivation; `False` is the debugging fallback) and `max_model_workers: int = 8` (cap on
+  the top-level pool so the rare 10-SCM run doesn't accidentally spawn 10 worker
+  processes each spawning their own per-adapter pool; actual workers used is
+  `min(len(climate_models_cfgs), max_model_workers)`). Note: this layer does not solve
+  per-adapter oversubscription on a shared node, which is the next bullet's job.
 - **Respect cluster CPU allocations.** Every adapter falls back to
   `multiprocessing.cpu_count()` when its `*_WORKER_NUMBER` env var is unset; on a SLURM
   node `cpu_count()` reports the whole physical node rather than your `--cpus-per-task`
@@ -279,7 +284,11 @@ should land before or alongside the adapter work, not after.
   years). Fix: an optional `output_writer=...` kwarg that writes per-(scenario, model)
   chunks to disk as netCDF (climate-community-friendly, xarray-native, plays well with
   CF conventions and downstream tooling) instead of returning one in-memory `ScmRun`.
-  Default behaviour stays the same so existing callers don't change.
+  When `output_writer` is set, `run.run` returns a lightweight `RunResult` object
+  carrying the list of written file paths plus summary metadata (number of chunks,
+  models, scenarios, total runs); keeps one-call workflows working without holding the
+  full ensemble in memory. When `output_writer` is `None` (default), behaviour is
+  identical to today: returns the merged `ScmRun`. Existing callers unchanged.
 
 Beyond these three, cross-node parallelism (dask, mpi4py) and resume-from-disk
 checkpointing are bigger lifts and are out of scope for v1; users can stripe across nodes
@@ -299,7 +308,10 @@ Decided 2026-05-22 ahead of any code changes.
 - **Existing adapters keep working by default.** Fortran CICERO-SCM and MAGICC7 (pymagicc)
   are non-negotiable: they stay. FaIR 1.6 stays if cheap, but is not critical: if keeping
   it working becomes a real maintenance drag (e.g. shared utility code starts to diverge
-  awkwardly to support both 1.6 and 2.x), it can be dropped with a deprecation cycle.
+  awkwardly to support both 1.6 and 2.x), it can be dropped with a deprecation cycle. The
+  existing `CICEROSCMPY` adapter (pinned to ciceroscm 1.1.1) stays as-is with no
+  deprecation; the new v2.x adapter ships alongside as `CICEROSCMPY2`. Drop revisited at a
+  future 1.0 cut.
 - **Numerical regression baselines may move** where the underlying model changed (the
   CSCM v2.0.0 tropospheric O3 refactor is the most obvious case). Baseline regenerations
   should land in their own PR with a one-line explanation in the changelog.
