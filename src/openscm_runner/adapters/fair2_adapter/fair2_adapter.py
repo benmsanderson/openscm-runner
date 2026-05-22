@@ -32,13 +32,22 @@ architecture notes.
 
 **Per-cfg sidecar keys**
 
-- ``native_calibration`` (required): filesystem path to the bundle
-  directory, or an in-memory :class:`NativeFairCalibration` instance.
-- ``member_indices`` (optional, default = all members): sequence of
-  zero-based ``int`` selecting which rows of the parameter posterior
-  to use as the FaIR config dimension. ``range(N)`` gives "first N
-  members"; an explicit list lets the user stratify or reproduce a
-  specific subset.
+- ``native_calibration`` (native mode, required): filesystem path to
+  the bundle directory, or an in-memory
+  :class:`NativeFairCalibration` instance.
+- ``member_indices`` (native mode, optional, default = all members):
+  sequence of zero-based ``int`` selecting which rows of the
+  parameter posterior to use as the FaIR config dimension.
+  ``range(N)`` gives "first N members"; an explicit list lets the
+  user stratify or reproduce a specific subset.
+- ``emissions_bundle`` (translated mode, optional): filesystem path
+  to a calibration bundle (or a :class:`NativeFairCalibration`).
+  When set, the bundle's historical emissions, species_configs and
+  natural forcings are used as the baseline; only the cfg dict's
+  climate parameters vary per member. All cfgs in one call must
+  share the same value. When omitted, translated mode falls back to
+  FaIR's ``fill_from_rcmip()`` (known to break against fair 2.2.4
+  for some species).
 """
 from __future__ import annotations
 
@@ -160,24 +169,42 @@ def _run_native_cfgs(scenarios, cfgs, output_variables) -> ScmRun:
     return run_append(results)
 
 
-def _run_translated_cfgs(scenarios, cfgs, output_variables) -> ScmRun:
+def _run_translated_cfgs(  # noqa: PLR0912, PLR0915
+    scenarios, cfgs, output_variables
+) -> ScmRun:
     """
     Translated-cfg dispatch: each cfg dict is one ensemble member
     whose keys are FaIR 2.x parameter names.
 
     All cfgs go into a single FAIR instance with ``config`` dim sized
     to ``len(cfgs)``, which is much faster than spawning one FAIR
-    per cfg. Species configs come from FaIR's shipped AR6 defaults
-    (``fill_species_configs()`` without arg). Climate configs are
-    populated from the cfg dicts.
+    per cfg. Climate configs are populated from the cfg dicts.
+
+    Two sub-modes, distinguished by the optional ``emissions_bundle``
+    sidecar key:
+
+    - **Bundle-backed (recommended).** Each cfg carries
+      ``emissions_bundle`` pointing at a calibration bundle (all
+      cfgs in one call must agree). Species configs, historical
+      emissions splice (with user ScmRun on top) and natural
+      forcings come from the bundle. This is the workhorse path
+      for parameter-sweep studies on realistic emissions.
+
+    - **RCMIP-defaults fallback.** No cfg carries
+      ``emissions_bundle``. Species configs come from FaIR's
+      shipped AR6 defaults and emissions are seeded from FaIR's
+      ``fill_from_rcmip()``. Note: fair 2.2.4's RCMIP loader is
+      known to break on HFC-4310mee (compound-convert key mismatch
+      with the upstream RCMIP CSV); use the bundle-backed path
+      until upstream fixes it.
 
     Supported cfg keys are anything FaIR 2.x exposes on
-    ``climate_configs`` or ``species_configs``; unknown keys are
-    logged at WARNING and ignored. If after population some required
-    climate_configs value is still NaN, FaIR's ``run()`` raises a
-    clear ``ValueError`` which we re-raise with a hint pointing back
-    at native-calibration mode for users who want defaults from a
-    published calibration.
+    ``climate_configs`` or ``species_configs``, plus the
+    ``emissions_bundle`` sidecar. Unknown keys are logged at
+    WARNING and ignored. If after population some required
+    climate_configs value is still NaN, FaIR's ``run()`` raises
+    ``ValueError`` which we re-raise with a hint pointing back at
+    native-calibration mode.
     """
     from fair.interface import fill
     from fair.io import read_properties
@@ -189,6 +216,22 @@ def _run_translated_cfgs(scenarios, cfgs, output_variables) -> ScmRun:
         else ["historical"]
     )
 
+    # All cfgs in one call share a single FAIR instance, so they must
+    # also share the bundle (which sets the species list, time axis
+    # of historical emissions, and natural forcings). Reject mixed
+    # configurations rather than silently using only one.
+    bundle_values = [cfg.get("emissions_bundle") for cfg in cfgs]
+    unique_bundles = {id(b) if not isinstance(b, (str, type(None))) else b
+                      for b in bundle_values}
+    if len(unique_bundles) > 1:
+        raise NotImplementedError(
+            "All cfgs in a single FaIRv2 translated-cfg call must "
+            "share the same `emissions_bundle` value (or all omit "
+            "it). Got %d distinct values." % len(unique_bundles)
+        )
+    bundle_value = bundle_values[0]
+    calibration = _resolve_calibration(bundle_value) if bundle_value else None
+
     # SCIENTIFIC CHOICE: same defaults as native mode (1750 start,
     # 1-year step). Made configurable in a follow-up.
     start_year = 1750
@@ -198,7 +241,12 @@ def _run_translated_cfgs(scenarios, cfgs, output_variables) -> ScmRun:
         else 2100
     )
 
-    species, properties = read_properties()  # FaIR's shipped AR6 defaults
+    if calibration is not None:
+        species, properties = read_properties(
+            filename=calibration.file("species_configs")
+        )
+    else:
+        species, properties = read_properties()
 
     config_labels = [f"config_{i}" for i in range(len(cfgs))]
 
@@ -221,19 +269,23 @@ def _run_translated_cfgs(scenarios, cfgs, output_variables) -> ScmRun:
     _initialise(f.cumulative_emissions, 0)
     _initialise(f.airborne_emissions, 0)
 
-    # Species configs from FaIR's shipped AR6 defaults; cfg-dict
-    # overrides are applied on top so user values win.
-    f.fill_species_configs()
+    if calibration is not None:
+        f.fill_species_configs(filename=calibration.file("species_configs"))
+    else:
+        f.fill_species_configs()
 
     LOGGER.info(
-        "Running FaIRv2 (translated) with %d ensemble members; "
+        "Running FaIRv2 (translated, %s) with %d ensemble members; "
         "climate_configs values come from cfg dicts",
+        "bundle-backed" if calibration is not None else "RCMIP defaults",
         len(cfgs),
     )
 
     unknown_keys: set[str] = set()
     for cfg_idx, cfg in enumerate(cfgs):
         for key, value in cfg.items():
+            if key == "emissions_bundle":
+                continue  # sidecar, handled above
             if key in f.climate_configs:
                 fill(f.climate_configs[key], value, config=config_labels[cfg_idx])
             elif key in f.species_configs:
@@ -249,36 +301,39 @@ def _run_translated_cfgs(scenarios, cfgs, output_variables) -> ScmRun:
             sorted(unknown_keys),
         )
 
-    # In translated mode there is no calibration bundle to splice
-    # historical emissions on top of, so fall back to FaIR's shipped
-    # RCMIP defaults for emissions. This gives a usable run as long
-    # as the user-requested scenario name matches an RCMIP scenario
-    # (the SSPs).
-    #
-    # NOTE: user emissions overrides via the ScmRun input are NOT
-    # currently merged on top in translated mode, because FaIR's
-    # fill_from_pandas requires the override DataFrame to cover every
-    # emissions species (otherwise IndexError on the unit lookup).
-    # Translated mode is therefore intended for parameter-sweep
-    # studies, not for scenario-driven runs. Pure scenario runs
-    # should use native-calibration mode (which splices user emissions
-    # on top of the bundle's historical). Documented as a v1 limit.
-    try:
-        f.fill_from_rcmip()
-    except Exception as exc:  # pylint: disable=broad-except
-        LOGGER.warning(
-            "FaIRv2 translated mode could not seed emissions from RCMIP "
-            "defaults (%s); the run will fail with NaN emissions unless "
-            "the cfg dicts populate every species.",
-            exc,
-        )
-    if scenario_run is not None and not scenario_run.empty:
-        LOGGER.warning(
-            "FaIRv2 translated mode ignores the user's `scenarios` "
-            "input in v1 (RCMIP defaults are used instead). Use "
-            "native-calibration mode if you need scenario-driven "
-            "emissions on top of a calibration."
-        )
+    if calibration is not None:
+        bundle_emissions_csv = calibration.file("historical_emissions")
+        if bundle_emissions_csv is not None or (
+            scenario_run is not None and not scenario_run.empty
+        ):
+            emissions_df = build_emissions_df(
+                scenario_run, bundle_emissions_csv, scenario_names
+            )
+            if not emissions_df.empty:
+                f.fill_from_pandas(mode="emissions", df=emissions_df)
+        _fill_natural_forcings(f, calibration)
+    else:
+        # No bundle: fall back to FaIR's RCMIP defaults. Known to
+        # break on fair 2.2.4 for HFC-4310mee; recommend bundle path.
+        # User emissions overrides via the ScmRun input are NOT merged
+        # on top in this path (fill_from_pandas requires complete
+        # coverage of every species, or it errors on the unit lookup).
+        try:
+            f.fill_from_rcmip()
+        except Exception as exc:  # pylint: disable=broad-except
+            LOGGER.warning(
+                "FaIRv2 translated mode could not seed emissions from "
+                "RCMIP defaults (%s). Pass `emissions_bundle` in each "
+                "cfg to use a calibration bundle for emissions instead.",
+                exc,
+            )
+        if scenario_run is not None and not scenario_run.empty:
+            LOGGER.warning(
+                "FaIRv2 translated mode without `emissions_bundle` "
+                "ignores the user's `scenarios` input (RCMIP defaults "
+                "are used). Pass `emissions_bundle` to splice user "
+                "scenarios on top of bundle historicals."
+            )
 
     try:
         f.run(progress=False, suppress_warnings=True)

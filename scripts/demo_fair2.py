@@ -20,8 +20,21 @@ PRs are in review.
 
 Usage:
 
-    export FAIR2_CALIBRATION_PATH=/path/to/extracted/zenodo/bundle
+    # One-time setup: minimal install with the FaIRv2 extra. The
+    # ``fair2`` extra pulls in ``fair>=2,<3``; it is mutually
+    # exclusive with the ``fair`` extra (which pins FaIR 1.6).
+    python -m venv .venv && source .venv/bin/activate
+    pip install -e ".[fair2]"
+
+    # Fetch the default v1.6.0 bundle (~2 MB of CSVs; skips the
+    # 2.9 GB reproducibility zip unless --include-zip is passed):
+    python scripts/download_fair2_calibration.py
+
+    export FAIR2_CALIBRATION_PATH=$PWD/configurations/fair-calibrate-v1.6.0
     python scripts/demo_fair2.py
+
+See ``scripts/download_fair2_calibration.py --help`` for picking a
+different Zenodo record or output directory.
 
 The bundle must contain at minimum:
 
@@ -188,6 +201,11 @@ def _translated_demo(bundle_path: str, scenarios, scenario_name: str) -> int:
         {
             **baseline,
             "ocean_heat_transfer": [fv, base_oht[1], base_oht[2]],
+            # Source emissions / species_configs / natural forcings
+            # from the bundle so the sweep runs against realistic
+            # inputs (fair 2.2.4's fill_from_rcmip is broken for
+            # HFC-4310mee).
+            "emissions_bundle": bundle_path,
         }
         for fv in feedback_values
     ]
