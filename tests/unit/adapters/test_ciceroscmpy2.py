@@ -114,6 +114,34 @@ def test_ciceroscmpy2_rejects_missing_distribution_json(tmp_path):
         )
 
 
+def test_ciceroscmpy2_bundle_mode_skips_splice_sidecar_validation(tmp_path):
+    """
+    Bundle mode (``cicero_bundle_dir`` set) drops the splice-mode
+    requirement for ``gaspam_file`` / ``concentrations_file`` because
+    those are derived from the bundle. The adapter should accept a
+    cfg with only ``distribution_json`` + ``cicero_bundle_dir`` and
+    fail later on the bundle-dir existence check rather than upfront
+    on missing splice-mode keys.
+    """
+    adapter = CICEROSCMPY2()
+    samples_json = tmp_path / "samples.json"
+    samples_json.write_text("[{\"pamset_udm\": {}, \"pamset_emiconc\": {}}]")
+    cfg = {
+        "distribution_json": str(samples_json),
+        "cicero_bundle_dir": str(tmp_path / "nonexistent_bundle"),
+    }
+    # Splice-mode missing-key ValueError mentions 'gaspam_file' /
+    # 'concentrations_file'; bundle-mode failure is a
+    # FileNotFoundError about the bundle directory itself.
+    with pytest.raises(FileNotFoundError, match="cicero_bundle_dir"):
+        adapter._run(
+            scenarios=None,
+            cfgs=[cfg],
+            output_variables=("Surface Air Temperature Change",),
+            output_config=None,
+        )
+
+
 def test_ciceroscmpy2_rejects_empty_member_indices(tmp_path):
     """
     An explicit empty member_indices is almost certainly a user

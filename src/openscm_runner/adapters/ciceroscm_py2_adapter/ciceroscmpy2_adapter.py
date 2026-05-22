@@ -24,57 +24,80 @@ DistributionRun API is the path AR7-relevant CICERO Monte-Carlo runs
 take, and a translated path adds bookkeeping that is not warranted by
 any current use case.
 
+**Two input modes**
+
+*Bundle mode* (recommended for AR7-relevant work). Set
+``cicero_bundle_dir`` to a directory laid out like Marit's
+``cscm-calibrate`` RCMIP working directory (the per-scenario
+``{scen}_em_{gases_ep}``, ``{scen}_conc_{gases_ep}``,
+``solar_RCMIP_{scen}_RCMIP3.txt``, ``VOLC_RCMIP_…``,
+``LUCalbedo_RCMIP_…``, plus ``natemis_CH4_…`` /
+``natemis_N2O_…`` and the gaspam). For each scenario in the user
+``scenarios`` ScmRun the adapter picks the matching files from the
+bundle, falling back to ``historical`` files when scenario-specific
+ones don't exist (the same logic ``run_full_rcmip_protocol.py``
+uses). This bypasses the v1.1.x SCENARIODATAGETTER splice entirely
+and reproduces the CICERO calibration's intended historical
+trajectory; the user's ScmRun is used only to enumerate scenario
+names and pick the end year (the bundle's scenario file is the
+source of truth for emissions).
+
+*Splice mode* (the original v1 behaviour). Set ``gaspam_file`` +
+``concentrations_file`` directly; the v1.1.x SCENARIODATAGETTER
+splices the user ScmRun on top of its bundled
+``ssp245_em_RCMIP.txt`` historical. Convenient for a quick run from
+an arbitrary ScmRun, but the splice biases ERF / GSAT high
+relative to AR6 observations (the bundled historical does not
+match the calibration posterior's expected forcing). Kept as a
+fallback for back-compat.
+
 **Per-cfg sidecar keys**
 
-- ``distribution_json`` (required): filesystem path to a parameter-
-  posterior JSON readable by ``DistributionRun``. Either a flat list
-  of cfg dicts or a ``{"meta_info": ..., "configurations": [...]}``
-  envelope is accepted (upstream handles both).
-- ``gaspam_file`` (required): filesystem path to a gases parameter
-  file (e.g. ``gases_vupdate_2022_AR6.txt``). Defines molecular
-  weights, lifetimes and radiative properties per species; the
-  scenario emissions header must list a superset of the gaspam's
-  species or CICERO-SCM raises.
-- ``concentrations_file`` (required): filesystem path to a historical
-  concentrations file covering ``nystart`` to ``emstart``. CICERO-SCM
-  drives concentrations directly over that range; emissions take over
-  from ``emstart`` onward.
+- ``distribution_json`` (always required): filesystem path to a
+  parameter-posterior JSON readable by ``DistributionRun``. Either
+  a flat list of cfg dicts or a
+  ``{"meta_info": ..., "configurations": [...]}`` envelope is
+  accepted (upstream handles both).
+- ``cicero_bundle_dir`` (bundle mode): directory containing the
+  per-scenario CICERO-format inputs. When set, all other file paths
+  default to canonical names within this directory and can be
+  overridden individually with the ``*_file`` keys.
+- ``cicero_gases_ep`` (bundle mode, optional): gaspam-name suffix
+  used to build per-scenario filenames. Default
+  ``"gases_vupdate_2024_WMO_added_new.txt"``.
+- ``gaspam_file`` (splice mode required, bundle mode optional):
+  filesystem path to a gases parameter file. In bundle mode
+  defaults to ``cicero_bundle_dir / cicero_gases_ep``.
+- ``concentrations_file`` (splice mode required, bundle mode
+  optional): historical concentrations covering ``nystart`` to
+  ``emstart``. In bundle mode picked per-scenario from the bundle.
 - ``member_indices`` (optional, default = all members in JSON):
-  sequence of zero-based ``int`` selecting which rows of the
-  parameter posterior to run. ``range(N)`` gives "first N members".
+  sequence of zero-based ``int`` selecting rows of the posterior.
 - ``max_workers`` (optional): forwarded to
   ``DistributionRun.run_over_distribution``. Defaults to
   :func:`openscm_runner.settings.get_worker_count` with
   ``CICEROSCM_WORKER_NUMBER`` as the override env var.
-- ``nystart`` / ``nyend`` / ``emstart`` (optional): time bounds
-  forwarded to CICERO-SCM. Defaults: ``nystart=1750``,
-  ``nyend=max(scenario_year)``, ``emstart=min(scenario_year)``.
-- ``sunvolc`` (optional, default ``1``): enables CICERO-SCM's bundled
-  solar / volcanic / land-use forcing inputs (``solar_IPCC.txt``,
-  ``meanVOLCmnd_ipcc_NH.txt``, ``IPCC_LUCalbedo.txt`` from the
-  ``ciceroscm`` package). Set to ``0`` for a sun/volcanic-free run.
+- ``nystart`` / ``nyend`` / ``emstart`` (optional): time bounds.
+  Defaults: ``nystart=1750``,
+  ``nyend=max(scenario_year)``. ``emstart`` defaults to 1850 in
+  bundle mode (matching Marit's setup) and to the first user-
+  scenario year in splice mode.
+- ``sunvolc`` (optional, default ``1``).
+- Optional pass-through forcing-file overrides: ``rf_sun_file``,
+  ``rf_volc_n_file``, ``rf_volc_s_file``, ``rf_volc_file``,
+  ``rf_luc_file``, ``nat_ch4_file``, ``nat_n2o_file``. In bundle
+  mode these override the per-scenario default lookup.
 
-**Species coverage and the ssp245 fallback**
+**ssp245 fallback note (splice mode only)**
 
-CICERO-SCM models a longer emissions species list than most
-openscm-runner scenario inputs carry (notably the legacy halocarbons
-CFC-11/12/113/114/115, HCFC-22/141b/123/142b, H-1211/1301/2402,
-CH3Br, CCl4, CH3CCl3, and the biomass-burning aerosol subspecies
-BMB_AEROS_BC / BMB_AEROS_OC). When the user's ``scenarios`` ScmRun
-omits a species CICERO-SCM expects, the splice machinery in
-:func:`openscm_runner.adapters.utils.cicero_utils.make_scenario_common.COMMONSFILEWRITER.make_printoutframe`
-falls back to the bundled
-``adapters/ciceroscm_adapter/utils_templates/ssp245_em_RCMIP.txt``
-historical trajectory for those species across the full scenario
-window, regardless of which SSP the user is actually running. This
-is inherited unchanged from the v1.1.x adapter.
-
-The fallback is exact for ssp245 runs and a small effect for the
-other SSPs (halocarbons are largely Montreal-Protocol-controlled
-and similar across SSPs). For a richer baseline, replace the
-omitted species in your input ScmRun directly; an
-``historical_emissions_file`` sidecar key to swap the fallback CSV
-is on the follow-up list.
+The splice mode's SCENARIODATAGETTER reuses the v1.1.x bundled
+``ssp245_em_RCMIP.txt`` for the historical period and for species
+the user scenario omits (legacy halocarbons CFC-11/12/113/114/115,
+HCFC-22/141b/123/142b, H-1211/1301/2402, CH3Br, CCl4, CH3CCl3, and
+the biomass-burning aerosol subspecies BMB_AEROS_BC /
+BMB_AEROS_OC). For non-ssp245 scenarios this silently uses ssp245
+trajectories. Bundle mode does not have this issue: each scenario's
+own emissions / concentrations file is used directly.
 """
 from __future__ import annotations
 
@@ -147,12 +170,24 @@ class CICEROSCMPY2(_Adapter):
             )
 
         for cfg in cfgs:
-            for key in ("distribution_json", "gaspam_file", "concentrations_file"):
+            if "distribution_json" not in cfg:
+                raise ValueError(
+                    "CICEROSCMPY2 cfg is missing required sidecar key "
+                    "'distribution_json'. See the adapter docstring for the "
+                    "full list of supported sidecar keys."
+                )
+            if "cicero_bundle_dir" in cfg:
+                # Bundle mode: paths derived from the bundle directory.
+                continue
+            # Splice mode: need explicit gaspam + concentrations files.
+            for key in ("gaspam_file", "concentrations_file"):
                 if key not in cfg:
                     raise ValueError(
                         f"CICEROSCMPY2 cfg is missing required sidecar key "
-                        f"{key!r}. See the adapter docstring for the full "
-                        "list of supported sidecar keys."
+                        f"{key!r}. Either supply gaspam_file + "
+                        "concentrations_file (splice mode) or set "
+                        "cicero_bundle_dir (bundle mode). See the adapter "
+                        "docstring."
                     )
 
         results = []
@@ -250,17 +285,37 @@ def _run_one_distribution(scenarios, cfg: dict[str, Any], output_variables) -> S
 
 def _build_scendata_list(scenarios, cfg: dict[str, Any]) -> list[dict[str, Any]]:
     """
-    Convert ``scenarios`` (ScmRun) into the list of dicts upstream wants.
+    Convert ``scenarios`` into the list of dicts upstream expects.
 
-    One dict per (model, scenario) pair. The emissions DataFrame is
-    built by SCENARIODATAGETTER (reused from the v1.1.x adapter),
-    which splices user emissions on top of the bundled ssp245
-    historical emissions.
+    Dispatches on the presence of ``cicero_bundle_dir`` in ``cfg``:
+
+    * Bundle mode: paths are resolved per-scenario from the bundle
+      directory (Marit-aligned setup). The user's ScmRun is used only
+      to enumerate scenario names and pick the end year.
+    * Splice mode: legacy path that uses SCENARIODATAGETTER to splice
+      the user's ScmRun on top of the bundled ssp245 historical
+      emissions.
+    """
+    if cfg.get("cicero_bundle_dir") is not None:
+        return _build_scendata_list_bundle(scenarios, cfg)
+    return _build_scendata_list_splice(scenarios, cfg)
+
+
+def _build_scendata_list_splice(
+    scenarios, cfg: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """
+    Splice-mode scendata builder.
+
+    One dict per (model, scenario) pair. Emissions are built by
+    SCENARIODATAGETTER (v1.1.x-inherited), which splices user emissions
+    on top of the bundled ssp245 historical.
     """
     if scenarios is None:
         raise ValueError(
-            "CICEROSCMPY2 requires `scenarios` to be provided (an "
-            "emissions ScmRun). Forcing-only runs are not yet supported."
+            "CICEROSCMPY2 splice mode requires `scenarios` to be provided "
+            "(an emissions ScmRun). Set cicero_bundle_dir to run from a "
+            "pre-built bundle without user emissions instead."
         )
 
     nystart = int(cfg.get("nystart", 1750))
@@ -297,11 +352,188 @@ def _build_scendata_list(scenarios, cfg: dict[str, Any]) -> list[dict[str, Any]]
             if opt_key in cfg:
                 scendata[opt_key] = cfg[opt_key]
         LOGGER.debug(
-            "CICEROSCMPY2 scendata for scenario=%s model=%s years=%d-%d",
+            "CICEROSCMPY2 splice scendata for scenario=%s model=%s years=%d-%d",
             scenario_name,
             model_name,
             nystart,
             nyend,
+        )
+        scendata_list.append(scendata)
+
+    return scendata_list
+
+
+# Default natural-emissions filenames in Marit's bundle layout.
+_DEFAULT_NATEMIS_CH4 = (
+    "natemis_CH4_ode_method_from_March2026_vupdate_2024_WMO_added_new.txt"
+)
+_DEFAULT_NATEMIS_N2O = (
+    "natemis_N2O_ode_method_from_March2026_vupdate_2024_WMO_added_new.txt"
+)
+# Default gaspam-name suffix used in scenario file lookups.
+_DEFAULT_GASES_EP = "gases_vupdate_2024_WMO_added_new.txt"
+
+
+def _pick_bundle_file(bundle_dir, candidates: list[str]) -> str:
+    """
+    Return the first existing path from ``candidates`` under ``bundle_dir``.
+
+    Mirrors the historical-fallback logic in Marit's
+    ``run_full_rcmip_protocol.make_scenariodata_argdict``: try the
+    scenario-specific name first, fall back to ``historical``.
+    """
+    for name in candidates:
+        p = os.path.join(bundle_dir, name)
+        if os.path.exists(p):
+            return p
+    raise FileNotFoundError(
+        f"None of these files exist in {bundle_dir}: {candidates}"
+    )
+
+
+def _load_natemis_dataframe(path: str, component: str, nystart: int):
+    """
+    Load a CICEROSCM natural-emissions file as a DataFrame.
+
+    ``ciceroscm.input_handler.read_natural_emissions`` requires the
+    file row count to match ``endyear - startyear + 1`` exactly and
+    defaults to ``endyear=2500``. Marit's bundled files cover
+    1750-2022 (273 rows), so we count rows and pass an explicit
+    ``endyear`` to avoid the size-mismatch error.
+    """
+    from ciceroscm import input_handler
+
+    with open(path) as fh:
+        n_rows = sum(1 for _ in fh)
+    file_endyear = nystart + n_rows - 1
+    return input_handler.read_natural_emissions(
+        path, component, startyear=nystart, endyear=file_endyear
+    )
+
+
+def _build_scendata_list_bundle(
+    scenarios, cfg: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """
+    Bundle-mode scendata builder (Marit's RCMIP setup).
+
+    For each scenario in ``scenarios`` (or just "historical" if none
+    given), picks ``{scen}_em_{gases_ep}``, ``{scen}_conc_{gases_ep}``,
+    and ``solar/VOLC/LUCalbedo_RCMIP_{scen}_RCMIP3.txt`` from the
+    bundle; falls back to ``historical_em_…`` / ``historical_conc_…``
+    / ``…_RCMIP_historical_RCMIP3.txt`` when scenario-specific files
+    don't exist. Natural CH4/N2O are loaded as DataFrames (the upstream
+    file reader requires exact row-count matching, which we handle).
+
+    Bypasses the v1.1.x SCENARIODATAGETTER splice entirely; the
+    bundle's scenario emissions file is the source of truth.
+    """
+    bundle_dir = cfg["cicero_bundle_dir"]
+    if not os.path.isdir(bundle_dir):
+        raise FileNotFoundError(
+            f"cicero_bundle_dir does not exist or is not a directory: "
+            f"{bundle_dir}"
+        )
+
+    gases_ep = cfg.get("cicero_gases_ep", _DEFAULT_GASES_EP)
+    gaspam_file = cfg.get("gaspam_file", os.path.join(bundle_dir, gases_ep))
+    if not os.path.exists(gaspam_file):
+        raise FileNotFoundError(
+            f"CICEROSCMPY2 bundle mode: gaspam_file not found at "
+            f"{gaspam_file}. Pass cicero_gases_ep or gaspam_file to "
+            "override."
+        )
+
+    nystart = int(cfg.get("nystart", 1750))
+    if scenarios is not None and not scenarios.empty:
+        scenario_years = scenarios.time_points.years()
+        nyend = int(cfg.get("nyend", max(scenario_years)))
+        scenario_names = sorted(set(scenarios["scenario"]))
+    else:
+        nyend = int(cfg.get("nyend", 2100))
+        scenario_names = ["historical"]
+    # SCIENTIFIC CHOICE: emstart=1850 in bundle mode (matches the
+    # AR6 / RCMIP3 convention Marit's calibration was built around;
+    # the 1750-1849 historical is concentration-driven for parity
+    # with the constraint targets). Splice mode keeps the legacy
+    # "first user-scenario year" default for back-compat.
+    emstart = int(cfg.get("emstart", 1850))
+    sunvolc = int(cfg.get("sunvolc", 1))
+
+    # Preload natural emissions DataFrames (avoids the read-time
+    # row-count-mismatch error in upstream's default endyear=2500).
+    nat_ch4_path = cfg.get(
+        "nat_ch4_file", os.path.join(bundle_dir, _DEFAULT_NATEMIS_CH4)
+    )
+    nat_n2o_path = cfg.get(
+        "nat_n2o_file", os.path.join(bundle_dir, _DEFAULT_NATEMIS_N2O)
+    )
+    nat_ch4_df = _load_natemis_dataframe(nat_ch4_path, "CH4", nystart)
+    nat_n2o_df = _load_natemis_dataframe(nat_n2o_path, "N2O", nystart)
+
+    scendata_list: list[dict[str, Any]] = []
+    for scenario_name in scenario_names:
+        em_path = cfg.get("emissions_file") or _pick_bundle_file(
+            bundle_dir,
+            [
+                f"{scenario_name}_em_{gases_ep}",
+                f"historical_em_{gases_ep}",
+            ],
+        )
+        conc_path = cfg.get("concentrations_file") or _pick_bundle_file(
+            bundle_dir,
+            [
+                f"{scenario_name}_conc_{gases_ep}",
+                f"historical_conc_{gases_ep}",
+            ],
+        )
+        sun_path = cfg.get("rf_solar_file") or _pick_bundle_file(
+            bundle_dir,
+            [
+                f"solar_RCMIP_{scenario_name}_RCMIP3.txt",
+                "solar_RCMIP_historical_RCMIP3.txt",
+            ],
+        )
+        volc_path = cfg.get("rf_volc_file") or _pick_bundle_file(
+            bundle_dir,
+            [
+                f"VOLC_RCMIP_{scenario_name}_RCMIP3.txt",
+                "VOLC_RCMIP_historical_RCMIP3.txt",
+            ],
+        )
+        luc_path = cfg.get("rf_luc_file") or _pick_bundle_file(
+            bundle_dir,
+            [
+                f"LUCalbedo_RCMIP_{scenario_name}_RCMIP3.txt",
+                "LUCalbedo_RCMIP_historical_RCMIP3.txt",
+            ],
+        )
+        scendata: dict[str, Any] = {
+            "nystart": nystart,
+            "nyend": nyend,
+            "emstart": emstart,
+            "sunvolc": sunvolc,
+            "conc_run": False,
+            "idtm": 24,
+            "scenname": scenario_name,
+            "gaspam_file": gaspam_file,
+            "emissions_file": em_path,
+            "concentrations_file": conc_path,
+            "rf_solar_file": sun_path,
+            "rf_volc_file": volc_path,
+            "rf_luc_file": luc_path,
+            "nat_ch4_data": nat_ch4_df.loc[: min(nyend, nat_ch4_df.index.max())],
+            "nat_n2o_data": nat_n2o_df.loc[: min(nyend, nat_n2o_df.index.max())],
+        }
+        LOGGER.debug(
+            "CICEROSCMPY2 bundle scendata for scenario=%s years=%d-%d "
+            "(emstart=%d) em=%s conc=%s",
+            scenario_name,
+            nystart,
+            nyend,
+            emstart,
+            os.path.basename(em_path),
+            os.path.basename(conc_path),
         )
         scendata_list.append(scendata)
 
