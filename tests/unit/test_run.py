@@ -180,6 +180,92 @@ def test_parallel_dispatch_uses_process_pool(dummy_adapters, monkeypatch):
     assert set(res["climate_model"]) == {"DummyA", "DummyB"}
 
 
+def test_output_writer_returns_runresult_and_skips_in_memory_append(
+    dummy_adapters, tmp_path
+):
+    written = []
+
+    def capture_writer(chunk, metadata):
+        path = tmp_path / f"{metadata['climate_model']}__{metadata['scenario']}.nc"
+        path.write_text("placeholder")
+        written.append((metadata["climate_model"], metadata["scenario"]))
+        return path
+
+    result = openscm_runner.run.run(
+        climate_models_cfgs={"DummyA": [{}], "DummyB": [{}]},
+        scenarios=None,
+        parallel_models=False,
+        output_writer=capture_writer,
+    )
+
+    from openscm_runner.output import RunResult
+
+    assert isinstance(result, RunResult)
+    assert result.n_chunks == 2
+    assert sorted(result.models) == ["DummyA", "DummyB"]
+    assert result.scenarios == ["test_scen"]
+    assert result.n_runs == 2
+    assert sorted(p.name for p in result.chunk_paths) == [
+        "DummyA__test_scen.nc",
+        "DummyB__test_scen.nc",
+    ]
+    assert sorted(written) == [
+        ("DummyA", "test_scen"),
+        ("DummyB", "test_scen"),
+    ]
+
+
+def test_output_writer_works_through_parallel_dispatch(
+    dummy_adapters, monkeypatch, tmp_path
+):
+    captured = {}
+
+    class _FakeFuture:
+        def __init__(self, func, args):
+            self._func = func
+            self._args = args
+
+        def result(self):
+            return self._func(*self._args)
+
+    class _FakePool:
+        def __init__(self, max_workers):
+            captured["max_workers"] = max_workers
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def submit(self, func, *args):
+            return _FakeFuture(func, args)
+
+    monkeypatch.setattr("openscm_runner.run.ProcessPoolExecutor", _FakePool)
+
+    written_paths = []
+
+    def writer(chunk, metadata):
+        path = tmp_path / f"{metadata['climate_model']}__{metadata['scenario']}.nc"
+        path.write_text("placeholder")
+        written_paths.append(path)
+        return path
+
+    result = openscm_runner.run.run(
+        climate_models_cfgs={"DummyA": [{}], "DummyB": [{}]},
+        scenarios=None,
+        parallel_models=True,
+        output_writer=writer,
+    )
+
+    from openscm_runner.output import RunResult
+
+    assert isinstance(result, RunResult)
+    assert captured["max_workers"] == 2
+    assert len(written_paths) == 2
+    assert result.n_chunks == 2
+
+
 def test_max_model_workers_caps_pool_size(dummy_adapters, monkeypatch):
     captured = {}
 
