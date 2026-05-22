@@ -157,7 +157,12 @@ def test_build_emissions_df_user_overrides_bundle_in_overlap(tmp_path):
     assert ch4_ssp126["2010"] == pytest.approx(340.0)
 
 
-def test_build_emissions_df_uses_user_unit(tmp_path):
+def test_build_emissions_df_keeps_bundle_unit_and_converts_user(tmp_path):
+    """
+    When user and bundle units differ, the splice keeps the bundle's
+    unit string (so the row is self-consistent) and converts the user's
+    values into that unit before overlaying.
+    """
     bundle_path = _bundle_csv(tmp_path)
     user = _user_scmrun()
     df = build_emissions_df(
@@ -168,8 +173,12 @@ def test_build_emissions_df_uses_user_unit(tmp_path):
     co2_ssp126 = df[
         (df["scenario"] == "ssp126") & (df["variable"] == "CO2 FFI")
     ].iloc[0]
-    # User's "GtCO2/yr" overwrites bundle's "Gt CO2/yr" in the spliced row.
-    assert co2_ssp126["unit"] == "GtCO2/yr"
+    # Bundle unit is preserved (the fixture writes "Gt CO2/yr"); user's
+    # "GtCO2/yr" is equivalent under openscm-units so the conversion
+    # factor is 1.0 and values pass through unchanged.
+    assert co2_ssp126["unit"] == "Gt CO2/yr"
+    assert co2_ssp126["2010"] == pytest.approx(35.0)
+    assert co2_ssp126["2020"] == pytest.approx(40.0)
 
 
 def test_build_emissions_df_drops_scenarios_not_in_run(tmp_path, caplog):

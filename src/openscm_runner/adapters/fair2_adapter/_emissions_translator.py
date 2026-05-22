@@ -141,6 +141,57 @@ def _openscm_to_fair2_species(variable: str) -> str | None:
     return None
 
 
+# FaIR species names whose unit conversion needs a non-default pint
+# context. NOx is the canonical case: openscm-units stores mass-of-NO2
+# unless you opt into the NOx_conversions context, which lets the same
+# number round-trip cleanly between MtN/yr and MtNO2/yr.
+#
+# These keys are FaIR 2.x species names (the post-translation form),
+# because `_splice_bundle_with_user` operates on rows whose `variable`
+# column has already been mapped to FaIR names.
+_UNIT_CONTEXTS = {
+    "NOx": "NOx_conversions",
+    "NH3": "NH3_conversions",
+}
+
+
+def _context_for(species_name: str) -> str | None:
+    return _UNIT_CONTEXTS.get(species_name)
+
+
+def _unit_scale(
+    from_unit: object, to_unit: object, variable: str
+) -> float | None:
+    """
+    Return the multiplicative factor that converts ``from_unit`` into
+    ``to_unit`` for ``variable``, using openscm-units, or ``None`` if
+    the conversion is not available.
+
+    Equal units (or missing user unit) returns ``1.0`` so callers can
+    treat ``None`` strictly as "could not convert, do not overlay".
+    """
+    if from_unit is None or pd.isna(from_unit):
+        return 1.0
+    from_str = str(from_unit).strip()
+    to_str = str(to_unit).strip() if to_unit is not None else from_str
+    if from_str == to_str:
+        return 1.0
+    import openscm_units
+
+    try:
+        context = _context_for(variable)
+        if context is not None:
+            with openscm_units.unit_registry.context(context):
+                return float(
+                    openscm_units.unit_registry(from_str).to(to_str).magnitude
+                )
+        return float(
+            openscm_units.unit_registry(from_str).to(to_str).magnitude
+        )
+    except Exception:  # pylint: disable=broad-except
+        return None
+
+
 def _scmrun_to_fair2_rows(scmrun, scenario_names: Iterable[str]) -> pd.DataFrame:
     """
     Pivot the user's ScmRun into one row per (scenario, species).
@@ -249,6 +300,20 @@ def _splice_bundle_with_user(
         return spliced_df
 
     # Overlay user data on top, per (scenario, variable) row.
+    #
+    # The unit story: bundle and user often disagree on the prefix
+    # (Gt vs Mt vs kt). Bundle's CO2 FFI is "Gt CO2/yr" while typical
+    # IAM output is "Mt CO2/yr"; if we just write the user's numbers
+    # into the bundle row and overwrite the unit string, the row ends
+    # up mixing bundle's Gt-scale historicals (1750-2023) with user's
+    # Mt-scale numbers (2015-2100) under a single "Mt CO2/yr" label.
+    # FaIR's downstream unit conversion then divides everything by
+    # 1000 and the historicals get destroyed.
+    #
+    # Fix: convert the user's values into the bundle's unit before
+    # writing them, and keep the bundle's unit on the row. If the
+    # conversion fails (unknown unit / species pair), log a warning
+    # and skip the overlay for that row.
     user_year_cols = [c for c in user_df.columns if isinstance(c, int)]
     for _, user_row in user_df.iterrows():
         mask = (spliced_df["scenario"] == user_row["scenario"]) & (
@@ -264,15 +329,27 @@ def _splice_bundle_with_user(
                 [spliced_df, pd.DataFrame([user_row])], ignore_index=True
             )
             continue
-        # Update the matching year columns
+
+        bundle_unit = spliced_df.loc[mask, "unit"].iloc[0]
+        user_unit = user_row.get("unit")
+        scale = _unit_scale(user_unit, bundle_unit, user_row["variable"])
+        if scale is None:
+            LOGGER.warning(
+                "Could not convert %r emissions from user unit %r to "
+                "bundle unit %r; user data NOT overlaid for this species, "
+                "bundle values left in place.",
+                user_row["variable"],
+                user_unit,
+                bundle_unit,
+            )
+            continue
+
         for year in user_year_cols:
             value = user_row[year]
             if pd.notna(value):
-                spliced_df.loc[mask, year] = value
-        # Prefer the user's unit string (assumes the user knows what they
-        # mean; FaIR will convert as needed).
-        if "unit" in user_row and pd.notna(user_row["unit"]):
-            spliced_df.loc[mask, "unit"] = user_row["unit"]
+                spliced_df.loc[mask, year] = value * scale
+        # Keep the bundle's unit (already there); don't overwrite with
+        # user's unit since we just converted the values.
 
     # SCIENTIFIC CHOICE: forward-fill NaN year cells.
     #
