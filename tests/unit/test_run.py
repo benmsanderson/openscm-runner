@@ -1,3 +1,4 @@
+import logging
 import re
 
 import pandas as pd
@@ -9,18 +10,20 @@ from openscm_runner.adapters import _registered_adapters, register_adapter_class
 from openscm_runner.adapters.base import _Adapter
 
 
-def test_run_out_config_conflict_error():
-    error_msg = re.escape(
+def test_run_out_config_conflict_error(caplog):
+    expected_log = (
         "Found model(s) in `out_config` which are not in "
         "`climate_models_cfgs`: {'another model'}"
     )
-    with pytest.raises(NotImplementedError):
-        with pytest.warns(UserWarning, match=error_msg):
+    with caplog.at_level(logging.WARNING, logger="openscm_runner.run"):
+        with pytest.raises(NotImplementedError):
             openscm_runner.run.run(
                 climate_models_cfgs={"model_a": ["config list"]},
                 scenarios="not used",
                 out_config={"another model": ("hi",)},
             )
+
+    assert expected_log in caplog.text
 
 
 def test_run_out_config_type_error():
