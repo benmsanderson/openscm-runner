@@ -53,8 +53,17 @@ pip install openscm-runner[models]
 # To add dependencies for MAGICC
 pip install openscm-runner[magicc]
 
-# To add dependencies for FaIR
+# To add dependencies for FaIR 1.6 (the older adapter)
 pip install openscm-runner[fair]
+
+# To add dependencies for FaIR 2.x (the newer adapter, AR7-era)
+pip install openscm-runner[fair2]
+#
+# Note: [fair] and [fair2] are mutually exclusive because they install
+# different major versions of the same `fair` PyPI package. Pick the
+# one that matches the adapter you intend to use (FaIR or FaIRv2).
+# The adapters detect mismatched installs and raise a clear ImportError
+# at construction time.
 
 # CICERO-SCM's Fortran binary requires no additional dependencies to be
 # installed
