@@ -43,8 +43,11 @@ elif [[ -n "${1:-}" ]]; then
   exit 2
 fi
 
-if [[ -n "$(git status --porcelain)" ]]; then
-  echo "ERROR: working tree is not clean. Commit or stash before running." >&2
+# Only block on uncommitted changes to tracked files; untracked files
+# (local venvs, scratch data, etc.) are unaffected by branch switching
+# and git reset --hard, so they are safe.
+if [[ -n "$(git status --porcelain --untracked-files=no)" ]]; then
+  echo "ERROR: tracked files have uncommitted changes. Commit or stash before running." >&2
   exit 1
 fi
 
