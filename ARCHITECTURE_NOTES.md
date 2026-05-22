@@ -323,6 +323,28 @@ Decided 2026-05-22 ahead of any code changes.
 In practice: pre-1.0 we add kwargs and keep existing adapters. At a 1.0 cut we revisit
 defaults and FaIR 1.6 retention.
 
+## Integration branch (development convenience, not a PR target)
+
+While the modernisation PRs are in review, a `modernisation/integration`
+branch on the fork carries the combined state of all in-flight feature
+branches so the combined feature set can be tested locally without
+waiting for upstream review. It is **not** a PR target and should
+**not** be merged to `main`; merge the individual feature branches via
+their own PRs.
+
+Rebuild it after pushing updates to any feature branch:
+
+```
+scripts/rebuild_integration_branch.sh         # local only
+scripts/rebuild_integration_branch.sh --push  # also force-push to origin
+```
+
+The script resets the branch to `origin/main` and re-merges every
+`modernisation/*` feature branch listed at the top of the script (with
+`--no-ff` so each merge commit documents which feature came from where).
+Update the `BRANCHES` array there when a new modernisation branch is
+added or when one merges to `main` and is deleted.
+
 ## Things to leave alone (per scope)
 
 - scmdata / pyam scenario representation (input shape stays the same).
