@@ -2,13 +2,12 @@
 Module for running FaIR
 """
 import logging
-import multiprocessing
 from concurrent.futures import ProcessPoolExecutor
 
 import numpy as np
 from scmdata import ScmRun, run_append
 
-from ...settings import config
+from ...settings import get_worker_count
 from ..utils._parallel_process import _parallel_process
 from ._compat import fair_scm
 
@@ -43,7 +42,7 @@ def run_fair(cfgs, output_vars):  # pylint: disable=R0914
                 updated_config[i][key] = value
         updated_config[i]["output_vars"] = output_vars
 
-    ncpu = int(config.get("FAIR_WORKER_NUMBER", multiprocessing.cpu_count()))
+    ncpu = get_worker_count("FAIR_WORKER_NUMBER")
     LOGGER.info("Running FaIR with %s workers", ncpu)
 
     parallel_process_kwargs = dict(

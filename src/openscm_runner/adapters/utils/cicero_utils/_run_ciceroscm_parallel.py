@@ -2,12 +2,11 @@
 Module for running CICEROSCM in parallel
 """
 import logging
-import os
 from concurrent.futures import ProcessPoolExecutor
 
 import scmdata
 
-from ....settings import config
+from ....settings import get_worker_count
 from ...utils._parallel_process import _parallel_process
 
 LOGGER = logging.getLogger(__name__)
@@ -49,7 +48,7 @@ def run_ciceroscm_parallel(scenarios, cfgs, output_vars, _execute_run):
         )
     ]
 
-    max_workers = int(config.get("CICEROSCM_WORKER_NUMBER", os.cpu_count()))
+    max_workers = get_worker_count("CICEROSCM_WORKER_NUMBER")
     LOGGER.info("Running in parallel with up to %d workers", max_workers)
 
     with ProcessPoolExecutor(max_workers=max_workers) as pool:
