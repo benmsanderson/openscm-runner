@@ -31,6 +31,7 @@ BRANCHES=(
   modernisation/python-3.12
   modernisation/worker-counts
   modernisation/netcdf-writer
+  modernisation/fair2-adapter
 )
 
 INTEGRATION_BRANCH="modernisation/integration"
