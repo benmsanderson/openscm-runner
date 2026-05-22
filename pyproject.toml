@@ -49,7 +49,15 @@ scmdata = ">=0.7.4"
 tqdm = "^4.66.1"
 # optional below here
 ciceroscm = { version = "1.1.1", optional = true }
-fair = { version = "<2", optional = true }
+# The `fair` PyPI package covers both FaIR 1.6 (used by `fair_adapter`)
+# and FaIR 2.x (used by `fair2_adapter`). Only one major version can be
+# installed at a time, so the `[fair]` and `[fair2]` extras below are
+# mutually exclusive. The version range here permits either; the
+# adapter `_compat` shims enforce the correct major version at runtime
+# and raise a clear ImportError otherwise. Users who need a hard pin
+# can supply one themselves alongside the extra (e.g.
+# `pip install openscm-runner[fair] "fair<2"`).
+fair = { version = ">=1.6,<3", optional = true }
 pymagicc = { version = "<3", optional = true }
 notebook = { version = "*", optional = true }
 seaborn = { version = "^0.13.1", optional = true }
@@ -58,7 +66,8 @@ ipywidgets = { version = "^8.1.1", optional = true }
 [tool.poetry.extras]
 notebooks = ["notebook", "seaborn", "ipywidgets"]
 ciceroscmpy = ["ciceroscm"]
-fair = ["fair"]
+fair = ["fair"]   # FaIR 1.6 adapter; mutually exclusive with [fair2]
+fair2 = ["fair"]  # FaIR 2.x adapter; mutually exclusive with [fair]
 magicc = ["pymagicc"]
 models = ["ciceroscm", "fair", "pymagicc"]
 

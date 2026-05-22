@@ -82,41 +82,25 @@ class FAIR2(_Adapter):
                 "`output_config` not implemented for FaIRv2"
             )
 
-        for cfg in cfgs:
-            if "native_calibration" not in cfg:
-                raise NotImplementedError(
-                    "FaIRv2 currently requires each cfg to carry a "
-                    "'native_calibration' sidecar key (path to a FaIR 2.x "
-                    "calibration bundle, or a NativeFairCalibration "
-                    "instance). Translated-cfg mode is a follow-up PR."
-                )
-
-        results = []
-        run_id_offset = 0
-        for cfg_index, cfg in enumerate(cfgs):
-            calibration = _resolve_calibration(cfg["native_calibration"])
-            member_indices = cfg.get("member_indices")
-            members = calibration.select_members(member_indices)
-
-            LOGGER.info(
-                "Running FaIRv2 (cfg %d/%d) with %d ensemble members from %s",
-                cfg_index + 1,
-                len(cfgs),
-                len(members),
-                calibration.path,
+        # Mode detection: each cfg dict is either native (carries a
+        # `native_calibration` sidecar key, expands to the calibration's
+        # parameter posterior) or translated (FaIR 2.x parameter names
+        # as dict keys, becomes a single config in FaIR's config dim).
+        # Mixed cfgs are rejected for now; supporting them is a
+        # straightforward follow-up but adds bookkeeping that is not
+        # warranted by any current use case.
+        native_flags = ["native_calibration" in cfg for cfg in cfgs]
+        if all(native_flags):
+            out = _run_native_cfgs(scenarios, cfgs, output_variables)
+        elif not any(native_flags):
+            out = _run_translated_cfgs(scenarios, cfgs, output_variables)
+        else:
+            raise NotImplementedError(
+                "FaIRv2 cfgs must be all-native or all-translated; mixing "
+                "native and translated cfgs in one call is not supported "
+                "in v1. Run the two modes in separate run.run calls."
             )
 
-            scmrun_chunk = _run_one_calibration(
-                scenarios=scenarios,
-                calibration=calibration,
-                members=members,
-                output_variables=output_variables,
-                run_id_offset=run_id_offset,
-            )
-            results.append(scmrun_chunk)
-            run_id_offset += len(members)
-
-        out = run_append(results)
         out["climate_model"] = f"FaIRv{self.get_version()}"
         return out
 
@@ -136,6 +120,155 @@ def _resolve_calibration(value: Any) -> NativeFairCalibration:
     if isinstance(value, NativeFairCalibration):
         return value
     return NativeFairCalibration(value)
+
+
+def _run_native_cfgs(scenarios, cfgs, output_variables) -> ScmRun:
+    """
+    Native-calibration dispatch: each cfg is a calibration choice
+    that expands to its parameter posterior on FaIR's config dim.
+
+    Each entry in ``cfgs`` becomes one FAIR run; results are
+    concatenated. ``run_id`` is assigned sequentially across all
+    members of all cfgs so the combined ScmRun has unique run_ids.
+    """
+    results = []
+    run_id_offset = 0
+    for cfg_index, cfg in enumerate(cfgs):
+        calibration = _resolve_calibration(cfg["native_calibration"])
+        member_indices = cfg.get("member_indices")
+        members = calibration.select_members(member_indices)
+
+        LOGGER.info(
+            "Running FaIRv2 (cfg %d/%d, native) with %d ensemble "
+            "members from %s",
+            cfg_index + 1,
+            len(cfgs),
+            len(members),
+            calibration.path,
+        )
+
+        scmrun_chunk = _run_one_calibration(
+            scenarios=scenarios,
+            calibration=calibration,
+            members=members,
+            output_variables=output_variables,
+            run_id_offset=run_id_offset,
+        )
+        results.append(scmrun_chunk)
+        run_id_offset += len(members)
+
+    return run_append(results)
+
+
+def _run_translated_cfgs(scenarios, cfgs, output_variables) -> ScmRun:
+    """
+    Translated-cfg dispatch: each cfg dict is one ensemble member
+    whose keys are FaIR 2.x parameter names.
+
+    All cfgs go into a single FAIR instance with ``config`` dim sized
+    to ``len(cfgs)``, which is much faster than spawning one FAIR
+    per cfg. Species configs come from FaIR's shipped AR6 defaults
+    (``fill_species_configs()`` without arg). Climate configs are
+    populated from the cfg dicts.
+
+    Supported cfg keys are anything FaIR 2.x exposes on
+    ``climate_configs`` or ``species_configs``; unknown keys are
+    logged at WARNING and ignored. If after population some required
+    climate_configs value is still NaN, FaIR's ``run()`` raises a
+    clear ``ValueError`` which we re-raise with a hint pointing back
+    at native-calibration mode for users who want defaults from a
+    published calibration.
+    """
+    from fair.interface import fill
+    from fair.io import read_properties
+
+    scenario_run = ScmRun(scenarios.timeseries()) if scenarios is not None else None
+    scenario_names = (
+        sorted(set(scenario_run["scenario"]))
+        if scenario_run is not None and not scenario_run.empty
+        else ["historical"]
+    )
+
+    # SCIENTIFIC CHOICE: same defaults as native mode (1750 start,
+    # 1-year step). Made configurable in a follow-up.
+    start_year = 1750
+    end_year = (
+        int(scenario_run.time_points.years().max())
+        if scenario_run is not None and not scenario_run.empty
+        else 2100
+    )
+
+    species, properties = read_properties()  # FaIR's shipped AR6 defaults
+
+    config_labels = [f"config_{i}" for i in range(len(cfgs))]
+
+    f = fair2.FAIR()
+    f.define_time(start_year, end_year, 1)
+    f.define_scenarios(scenario_names)
+    f.define_configs(config_labels)
+    f.define_species(species, properties)
+    f.allocate()
+
+    # Species configs from FaIR's shipped AR6 defaults; cfg-dict
+    # overrides are applied on top so user values win.
+    f.fill_species_configs()
+
+    LOGGER.info(
+        "Running FaIRv2 (translated) with %d ensemble members; "
+        "climate_configs values come from cfg dicts",
+        len(cfgs),
+    )
+
+    unknown_keys: set[str] = set()
+    for cfg_idx, cfg in enumerate(cfgs):
+        for key, value in cfg.items():
+            if key in f.climate_configs:
+                fill(f.climate_configs[key], value, config=config_labels[cfg_idx])
+            elif key in f.species_configs:
+                fill(f.species_configs[key], value, config=config_labels[cfg_idx])
+            else:
+                unknown_keys.add(key)
+
+    if unknown_keys:
+        LOGGER.warning(
+            "FaIRv2 translated-cfg mode ignored unknown parameter "
+            "names: %s. Valid names are FaIR 2.x climate_configs / "
+            "species_configs keys.",
+            sorted(unknown_keys),
+        )
+
+    if scenario_run is not None and not scenario_run.empty:
+        emissions_df = build_emissions_df(
+            scenario_run, None, scenario_names
+        )
+        if not emissions_df.empty:
+            f.fill_from_pandas(mode="emissions", df=emissions_df)
+
+    try:
+        f.run(progress=False, suppress_warnings=True)
+    except ValueError as exc:
+        if "NaN values" in str(exc):
+            raise ValueError(
+                "FaIR 2.x rejected the run because required "
+                "climate_configs values are missing. Translated-cfg "
+                "mode requires each cfg to fully specify the climate "
+                "parameters FaIR needs (ocean_heat_capacity, "
+                "ocean_heat_transfer, deep_ocean_efficacy, "
+                "forcing_4co2 at minimum). For runs that should use "
+                "a published calibration as the baseline, pass "
+                "'native_calibration' in the cfg instead. Original "
+                f"FaIR error: {exc}"
+            ) from exc
+        raise
+
+    return extract_outputs(
+        f,
+        scenario_names,
+        pd.DataFrame(index=range(len(cfgs))),  # one row per ensemble member
+        output_variables,
+        run_id_offset=0,
+        properties_df=getattr(f, "properties_df", None),
+    )
 
 
 def _run_one_calibration(  # noqa: PLR0913

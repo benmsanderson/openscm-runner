@@ -113,13 +113,36 @@ def test_native_calibration_file_returns_none_for_absent_optional(tmp_path):
     assert cal.file("species_configs") is not None
 
 
-def test_fair2_run_rejects_cfg_without_native_calibration():
+def test_fair2_translated_cfg_with_no_climate_configs_raises_useful_error():
+    """
+    Translated-cfg mode runs without a calibration bundle. If the cfg
+    dicts do not supply the climate_configs values FaIR needs, FaIR
+    rejects the run; the adapter re-raises with a hint pointing at
+    native-calibration mode.
+    """
     adapter = FAIR2()
-    with pytest.raises(NotImplementedError, match="native_calibration"):
-        # We never reach FaIR; the check runs before any setup.
+    with pytest.raises(ValueError, match="native_calibration"):
         adapter._run(
             scenarios=None,
-            cfgs=[{}],
+            cfgs=[{}],  # empty: nothing populates climate_configs
+            output_variables=("Surface Air Temperature Change",),
+            output_config=None,
+        )
+
+
+def test_fair2_run_rejects_mixed_native_and_translated_cfgs():
+    """
+    Each cfg list must be entirely native or entirely translated;
+    mixing the two in one call is rejected for clarity.
+    """
+    adapter = FAIR2()
+    with pytest.raises(NotImplementedError, match="all-native or all-translated"):
+        adapter._run(
+            scenarios=None,
+            cfgs=[
+                {"native_calibration": "/does/not/matter"},
+                {"forcing_4co2": 8.0},
+            ],
             output_variables=("Surface Air Temperature Change",),
             output_config=None,
         )
@@ -134,3 +157,38 @@ def test_fair2_run_rejects_output_config():
             output_variables=("Surface Air Temperature Change",),
             output_config=("foo",),
         )
+
+
+def test_fair2_translated_cfg_warns_on_unknown_parameter_names(caplog):
+    """
+    Translated-cfg mode logs a WARNING when a cfg dict carries keys
+    that are not valid FaIR 2.x climate_configs or species_configs
+    names. The check runs before the FaIR simulation so we can verify
+    it fires even when the run itself fails.
+    """
+    import logging
+
+    adapter = FAIR2()
+    # The cfg has both a real FaIR parameter (forcing_4co2) and a
+    # made-up key (definitely_not_a_fair_parameter). The run will
+    # error later due to missing other climate_configs, but the
+    # WARN should appear in the log before that.
+    with caplog.at_level(
+        logging.WARNING,
+        logger="openscm_runner.adapters.fair2_adapter.fair2_adapter",
+    ):
+        with pytest.raises(ValueError):
+            adapter._run(
+                scenarios=None,
+                cfgs=[
+                    {
+                        "forcing_4co2": 8.0,
+                        "definitely_not_a_fair_parameter": 1.0,
+                    }
+                ],
+                output_variables=("Surface Air Temperature Change",),
+                output_config=None,
+            )
+
+    assert "definitely_not_a_fair_parameter" in caplog.text
+    assert "ignored unknown parameter names" in caplog.text
