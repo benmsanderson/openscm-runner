@@ -86,16 +86,29 @@ def _user_scmrun():
 
 
 def test_species_mapping_matches_openscm_names():
+    # GHGs
     assert (
         _openscm_to_fair2_species("Emissions|CO2|MAGICC Fossil and Industrial")
         == "CO2 FFI"
     )
-    assert (
-        _openscm_to_fair2_species("Emissions|CO2|MAGICC AFOLU") == "CO2 AFOLU"
-    )
+    assert _openscm_to_fair2_species("Emissions|CO2|MAGICC AFOLU") == "CO2 AFOLU"
     assert _openscm_to_fair2_species("Emissions|CH4") == "CH4"
     assert _openscm_to_fair2_species("Emissions|N2O") == "N2O"
-    assert _openscm_to_fair2_species("Emissions|Sulfur") is None
+    # Aerosols / SLCFs (with MAGICC adapter aliases)
+    assert _openscm_to_fair2_species("Emissions|Sulfur") == "Sulfur"
+    assert _openscm_to_fair2_species("Emissions|SOx") == "Sulfur"
+    assert _openscm_to_fair2_species("Emissions|VOC") == "VOC"
+    assert _openscm_to_fair2_species("Emissions|NMVOC") == "VOC"
+    # FaIR 2.x uses hyphenated names; the openscm-runner / MAGICC names
+    # do not.
+    assert _openscm_to_fair2_species("Emissions|CFC11") == "CFC-11"
+    assert _openscm_to_fair2_species("Emissions|HFC4310mee") == "HFC-4310mee"
+    assert _openscm_to_fair2_species("Emissions|Halon1211") == "Halon-1211"
+    assert _openscm_to_fair2_species("Emissions|cC4F8") == "c-C4F8"
+    # Genuinely unmapped: a non-emissions variable, and a made-up
+    # species that does not exist in FaIR 2.x's AR6 default set.
+    assert _openscm_to_fair2_species("Atmospheric Concentrations|CO2") is None
+    assert _openscm_to_fair2_species("Emissions|MadeUpSpecies") is None
 
 
 def test_build_emissions_df_bundle_only_relabels_scenarios(tmp_path):
@@ -173,11 +186,12 @@ def test_build_emissions_df_drops_scenarios_not_in_run(tmp_path, caplog):
 
 def test_build_emissions_df_warns_on_unmapped_variables(tmp_path, caplog):
     bundle_path = _bundle_csv(tmp_path)
-    # User supplies Sulfur which isn't in OPENSCM_TO_FAIR2_SPECIES
+    # A made-up species not in the FaIR 2.x AR6 default set; the
+    # translator should warn and skip rather than crash.
     df_user = pd.DataFrame(
         [[10.0, 11.0]],
         index=pd.MultiIndex.from_tuples(
-            [("iam", "ssp245", "World", "MtSO2/yr", "Emissions|Sulfur", 0)],
+            [("iam", "ssp245", "World", "Mt/yr", "Emissions|MadeUpSpecies", 0)],
             names=["model", "scenario", "region", "unit", "variable", "run_id"],
         ),
         columns=[2010, 2020],
@@ -197,7 +211,7 @@ def test_build_emissions_df_warns_on_unmapped_variables(tmp_path, caplog):
         )
 
     assert "Unmapped variables" in caplog.text
-    assert "Emissions|Sulfur" in caplog.text
+    assert "Emissions|MadeUpSpecies" in caplog.text
     # Bundle still produces rows for ssp245 (just nothing user-side overrides)
     assert set(df["scenario"].unique()) == {"ssp245"}
 

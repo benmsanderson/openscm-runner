@@ -45,7 +45,6 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-import numpy as np
 import pandas as pd
 from scmdata import ScmRun, run_append
 
@@ -53,6 +52,7 @@ from ..base import _Adapter
 from ._compat import HAS_FAIR2, fair2
 from ._emissions_translator import build_emissions_df
 from ._native_calibration import NativeFairCalibration
+from ._output_extractor import extract_outputs
 
 LOGGER = logging.getLogger(__name__)
 
@@ -219,105 +219,11 @@ def _run_one_calibration(  # noqa: PLR0913
 
     f.run(progress=False, suppress_warnings=True)
 
-    return _extract_outputs(
-        f, scenario_names, members, output_variables, run_id_offset
+    return extract_outputs(
+        f,
+        scenario_names,
+        members,
+        output_variables,
+        run_id_offset,
+        properties_df=getattr(f, "properties_df", None),
     )
-
-
-def _extract_outputs(  # noqa: PLR0913
-    f,
-    scenarios,
-    members: pd.DataFrame,
-    output_variables,
-    run_id_offset: int,
-) -> ScmRun:
-    """
-    Convert FaIR 2.x's xarray output into an :class:`scmdata.ScmRun`.
-
-    Supported output variables in this v1:
-
-    - ``Surface Air Temperature Change`` (layer-0 of FaIR's temperature
-      array)
-    - ``Effective Radiative Forcing`` (sum across species)
-    - ``Atmospheric Concentrations|CO2`` (the combined CO2 species)
-
-    Anything else is silently dropped (matches FaIR 1.6 adapter
-    behaviour, which logs but does not error on unknown output vars).
-    """
-    rows = []
-
-    def _row(variable, unit, values, scenario, member_idx, run_id):
-        rows.append(
-            (
-                scenario,
-                "FaIR",  # placeholder; will be overwritten by the adapter
-                "World",
-                variable,
-                unit,
-                run_id,
-                values,
-            )
-        )
-
-    timebounds = np.asarray(f.timebounds, dtype=int)
-
-    for sc_idx, scenario in enumerate(scenarios):
-        for member_offset, member_label in enumerate(members.index):
-            run_id = run_id_offset + member_offset
-            for variable in output_variables:
-                if variable == "Surface Air Temperature Change":
-                    series = (
-                        f.temperature.isel(
-                            scenario=sc_idx, config=member_offset, layer=0
-                        )
-                        .to_pandas()
-                        .reindex(timebounds)
-                    )
-                    _row(variable, "K", series, scenario, member_offset, run_id)
-                elif variable == "Effective Radiative Forcing":
-                    series = (
-                        f.forcing.isel(scenario=sc_idx, config=member_offset)
-                        .sum(dim="specie")
-                        .to_pandas()
-                        .reindex(timebounds)
-                    )
-                    _row(
-                        variable, "W/m^2", series, scenario, member_offset, run_id
-                    )
-                elif variable == "Atmospheric Concentrations|CO2":
-                    # Use the combined "CO2" species emitted by FaIR
-                    # (sum of CO2 FFI and CO2 AFOLU contributions).
-                    series = (
-                        f.concentration.sel(specie="CO2")
-                        .isel(scenario=sc_idx, config=member_offset)
-                        .to_pandas()
-                        .reindex(timebounds)
-                    )
-                    _row(variable, "ppm", series, scenario, member_offset, run_id)
-                else:
-                    LOGGER.debug(
-                        "FaIRv2 adapter v1 does not emit %s; ignored", variable
-                    )
-
-    if not rows:
-        return ScmRun(pd.DataFrame())
-
-    return _build_scmrun(rows, timebounds)
-
-
-def _build_scmrun(rows, timebounds):
-    """
-    Stack the per-(scenario, member, variable) Series produced by
-    :func:`_extract_outputs` into a single :class:`scmdata.ScmRun`.
-    """
-    data = np.vstack([row[6].values for row in rows])
-    meta = pd.DataFrame(
-        [row[:6] for row in rows],
-        columns=["scenario", "model", "region", "variable", "unit", "run_id"],
-    )
-    df = pd.DataFrame(
-        data,
-        index=pd.MultiIndex.from_frame(meta),
-        columns=timebounds,
-    )
-    return ScmRun(df)

@@ -54,18 +54,83 @@ LOGGER = logging.getLogger(__name__)
 
 
 # Suffix-match openscm-runner variable names to FaIR 2.x species names.
-# Suffix-match lets callers use the full hierarchical names
-# ("Emissions|CO2|MAGICC Fossil and Industrial") interchangeably with
-# the leaf-only forms.
 #
-# v1 mapping covers the headline GHGs the AR7 priority workloads need.
-# Extending this is the obvious follow-up: add the other species in
-# fair.io.read_properties() (~64 in the AR6 default set).
+# Suffix-match lets callers use the full hierarchical IAMC names
+# ("Emissions|CO2|MAGICC Fossil and Industrial",
+# "Emissions|F-Gases|HFC|HFC152a", ...) interchangeably with the
+# leaf-only forms. Most differences from openscm-runner's names are
+# the hyphens FaIR 2.x uses for CFC/HCFC/Halon/HFC families (e.g.
+# "CFC11" -> "CFC-11", "HFC4310mee" -> "HFC-4310mee", "Halon1211"
+# -> "Halon-1211").
+#
+# Covers all 49 emissions-input species in the FaIR 2.x AR6 default
+# set (those with input_mode="emissions" in fair.io.read_properties).
+# Solar and Volcanic are forcing-mode in FaIR 2.x and provided by the
+# calibration bundle, not user-supplied here.
 OPENSCM_TO_FAIR2_SPECIES = {
+    # CO2 emissions are split into FFI and AFOLU sources in both
+    # naming conventions. FaIR 2.x computes the "CO2" total internally.
     "|CO2|MAGICC Fossil and Industrial": "CO2 FFI",
     "|CO2|MAGICC AFOLU": "CO2 AFOLU",
+    # Direct GHGs
     "|CH4": "CH4",
     "|N2O": "N2O",
+    # Short-lived climate forcers and aerosol precursors
+    "|Sulfur": "Sulfur",
+    "|SOx": "Sulfur",  # MAGICC adapter alias
+    "|BC": "BC",
+    "|OC": "OC",
+    "|NH3": "NH3",
+    "|NOx": "NOx",
+    "|VOC": "VOC",
+    "|NMVOC": "VOC",  # MAGICC adapter alias
+    "|CO": "CO",
+    # Montreal Protocol halogens (CFCs, HCFCs, halons, miscellaneous
+    # halogenated species). FaIR 2.x uses hyphenated names.
+    "|CFC11": "CFC-11",
+    "|CFC12": "CFC-12",
+    "|CFC113": "CFC-113",
+    "|CFC114": "CFC-114",
+    "|CFC115": "CFC-115",
+    "|CCl4": "CCl4",
+    "|CH3CCl3": "CH3CCl3",
+    "|CHCl3": "CHCl3",
+    "|CH2Cl2": "CH2Cl2",
+    "|CH3Cl": "CH3Cl",
+    "|CH3Br": "CH3Br",
+    "|HCFC22": "HCFC-22",
+    "|HCFC141b": "HCFC-141b",
+    "|HCFC142b": "HCFC-142b",
+    "|Halon1202": "Halon-1202",
+    "|Halon1211": "Halon-1211",
+    "|Halon1301": "Halon-1301",
+    "|Halon2402": "Halon-2402",
+    # F-gases: PFCs
+    "|CF4": "CF4",
+    "|C2F6": "C2F6",
+    "|C3F8": "C3F8",
+    "|cC4F8": "c-C4F8",
+    "|C4F10": "C4F10",
+    "|C5F12": "C5F12",
+    "|C6F14": "C6F14",
+    "|C7F16": "C7F16",
+    "|C8F18": "C8F18",
+    # F-gases: other
+    "|NF3": "NF3",
+    "|SF6": "SF6",
+    "|SO2F2": "SO2F2",
+    # F-gases: HFCs
+    "|HFC23": "HFC-23",
+    "|HFC32": "HFC-32",
+    "|HFC125": "HFC-125",
+    "|HFC134a": "HFC-134a",
+    "|HFC143a": "HFC-143a",
+    "|HFC152a": "HFC-152a",
+    "|HFC227ea": "HFC-227ea",
+    "|HFC236fa": "HFC-236fa",
+    "|HFC245fa": "HFC-245fa",
+    "|HFC365mfc": "HFC-365mfc",
+    "|HFC4310mee": "HFC-4310mee",
 }
 
 
@@ -218,9 +283,12 @@ def build_emissions_df(
     scenario_names: Iterable[str],
 ) -> pd.DataFrame:
     """
-    Build the FaIR 2.x-shaped emissions DataFrame for the given user
-    scenarios, splicing the bundle's historical emissions with the
-    user's scenario data.
+    Build the FaIR 2.x-shaped emissions DataFrame.
+
+    Splices the calibration bundle's historical emissions with the
+    user's scenario data and returns one row per (scenario, species)
+    in the horizontal form FaIR's :meth:`fair.FAIR.fill_from_pandas`
+    expects.
 
     Parameters
     ----------
