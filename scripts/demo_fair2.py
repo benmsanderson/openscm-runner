@@ -143,14 +143,24 @@ def main() -> int:
 
 def _translated_demo(bundle_path: str, scenarios, scenario_name: str) -> int:
     """
-    Sweep ``forcing_4co2`` in translated-cfg mode and print 2100 GSAT.
+    Sweep climate feedback in translated-cfg mode and print 2100 GSAT.
 
-    Uses the bundle's first posterior member as the baseline for all
-    climate_configs other than ``forcing_4co2`` so we are not
+    Varies ``ocean_heat_transfer[0]``, the upper-layer feedback
+    parameter (effectively the climate feedback strength lambda; lower
+    means more sensitive). Uses the bundle's first posterior member
+    as the baseline for all other climate_configs so we are not
     hardcoding physics values; only the swept parameter varies.
+
+    (``forcing_4co2`` is a structural EBM constant in FaIR 2.x rather
+    than a temperature driver, so sweeping it does not change GSAT
+    on its own; ``ocean_heat_transfer[0]`` is the more direct knob
+    for demonstrating climate sensitivity.)
     """
     print()
-    print("=== Translated-cfg mode demo: forcing_4co2 sensitivity sweep ===")
+    print(
+        "=== Translated-cfg mode demo: climate-feedback sweep "
+        "(ocean_heat_transfer[0], W/m^2/K) ==="
+    )
 
     try:
         baseline = _load_baseline_climate_configs(bundle_path)
@@ -168,8 +178,19 @@ def _translated_demo(bundle_path: str, scenarios, scenario_name: str) -> int:
         f"first posterior member: {sorted(baseline)}"
     )
 
-    forcing_values = (6.0, 7.0, 8.0, 9.0)
-    cfgs = [{**baseline, "forcing_4co2": fv} for fv in forcing_values]
+    # Sweep the upper-layer feedback parameter while holding everything
+    # else (including the deeper-layer transfer terms) at the baseline.
+    base_oht = baseline.get(
+        "ocean_heat_transfer", [1.77, 2.51, 0.55]
+    )
+    feedback_values = (0.5, 1.0, 1.5, 2.5)
+    cfgs = [
+        {
+            **baseline,
+            "ocean_heat_transfer": [fv, base_oht[1], base_oht[2]],
+        }
+        for fv in feedback_values
+    ]
 
     result = openscm_runner.run.run(
         climate_models_cfgs={"FaIRv2": cfgs},
@@ -179,18 +200,21 @@ def _translated_demo(bundle_path: str, scenarios, scenario_name: str) -> int:
     )
 
     print(
-        f"2100 GSAT response to forcing_4co2 sweep "
+        f"2100 GSAT response to feedback sweep "
         f"(scenario {scenario_name}, all other climate_configs held at the "
         "bundle's first-member values):"
     )
-    for run_id, fv in enumerate(forcing_values):
+    for run_id, fv in enumerate(feedback_values):
         gsat = result.filter(
             variable="Surface Air Temperature Change",
             year=2100,
             scenario=scenario_name,
             run_id=run_id,
         ).values
-        print(f"  forcing_4co2 = {fv:.1f} W/m^2  ->  2100 GSAT = {float(gsat):.2f} K")
+        print(
+            f"  ocean_heat_transfer[0] = {fv:.2f} W/m^2/K  ->  "
+            f"2100 GSAT = {float(gsat):.2f} K"
+        )
 
     return 0
 

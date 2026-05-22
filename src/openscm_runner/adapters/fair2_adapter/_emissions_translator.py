@@ -274,6 +274,29 @@ def _splice_bundle_with_user(
         if "unit" in user_row and pd.notna(user_row["unit"]):
             spliced_df.loc[mask, "unit"] = user_row["unit"]
 
+    # SCIENTIFIC CHOICE: forward-fill NaN year cells.
+    #
+    # When the user's scenario adds year columns the bundle did not
+    # cover (e.g. user supplies decadal future emissions for CO2 FFI,
+    # so columns 2030/2040/... get added globally), the rows for
+    # species the user did NOT provide (e.g. CFC-11) end up with NaN
+    # in those new columns. FaIR's interp1d then propagates the NaN
+    # downstream and the simulation refuses to start.
+    #
+    # We forward-fill across the year axis per row so that any species
+    # the user does not supply for the future is held constant at its
+    # last historical value (typically the 2023 bundle value).
+    # Alternatives considered: zero-fill (wrong for slowly-decaying
+    # species like CFCs), linear extrapolation (hard to defend across
+    # 60+ species with different baseline dynamics). The forward-fill
+    # is a deliberately conservative choice and will be made
+    # configurable when a real use case asks.
+    year_cols_sorted = sorted(
+        c for c in spliced_df.columns if isinstance(c, int)
+    )
+    if year_cols_sorted:
+        spliced_df[year_cols_sorted] = spliced_df[year_cols_sorted].ffill(axis=1)
+
     return spliced_df
 
 
@@ -324,4 +347,15 @@ def build_emissions_df(
     if bundle_df.empty and user_df.empty:
         return pd.DataFrame()
 
-    return _splice_bundle_with_user(bundle_df, user_df, scenario_names)
+    spliced = _splice_bundle_with_user(bundle_df, user_df, scenario_names)
+    # FaIR 2.x's fill_from_pandas runs `df.columns.str.lower()` on the
+    # DataFrame, which silently replaces non-string column labels with
+    # NaN under a mixed-type Index (str metadata + int years). Convert
+    # year columns back to strings here so FaIR sees them. We use ints
+    # internally during the splice because `.loc[mask, year] = value`
+    # is easier to reason about with int keys; the string round-trip is
+    # a one-liner at the boundary.
+    spliced.columns = [
+        str(c) if isinstance(c, int) else c for c in spliced.columns
+    ]
+    return spliced

@@ -209,6 +209,18 @@ def _run_translated_cfgs(scenarios, cfgs, output_variables) -> ScmRun:
     f.define_species(species, properties)
     f.allocate()
 
+    # allocate() leaves state arrays as NaN, which FaIR's run() then
+    # propagates forward from t=0. Initialise to zero so the
+    # integration has a defined starting point. See _run_one_calibration
+    # for the equivalent in native mode.
+    from fair.interface import initialise as _initialise
+
+    _initialise(f.temperature, 0)
+    _initialise(f.forcing, 0)
+    _initialise(f.concentration, 0)
+    _initialise(f.cumulative_emissions, 0)
+    _initialise(f.airborne_emissions, 0)
+
     # Species configs from FaIR's shipped AR6 defaults; cfg-dict
     # overrides are applied on top so user values win.
     f.fill_species_configs()
@@ -237,12 +249,36 @@ def _run_translated_cfgs(scenarios, cfgs, output_variables) -> ScmRun:
             sorted(unknown_keys),
         )
 
-    if scenario_run is not None and not scenario_run.empty:
-        emissions_df = build_emissions_df(
-            scenario_run, None, scenario_names
+    # In translated mode there is no calibration bundle to splice
+    # historical emissions on top of, so fall back to FaIR's shipped
+    # RCMIP defaults for emissions. This gives a usable run as long
+    # as the user-requested scenario name matches an RCMIP scenario
+    # (the SSPs).
+    #
+    # NOTE: user emissions overrides via the ScmRun input are NOT
+    # currently merged on top in translated mode, because FaIR's
+    # fill_from_pandas requires the override DataFrame to cover every
+    # emissions species (otherwise IndexError on the unit lookup).
+    # Translated mode is therefore intended for parameter-sweep
+    # studies, not for scenario-driven runs. Pure scenario runs
+    # should use native-calibration mode (which splices user emissions
+    # on top of the bundle's historical). Documented as a v1 limit.
+    try:
+        f.fill_from_rcmip()
+    except Exception as exc:  # pylint: disable=broad-except
+        LOGGER.warning(
+            "FaIRv2 translated mode could not seed emissions from RCMIP "
+            "defaults (%s); the run will fail with NaN emissions unless "
+            "the cfg dicts populate every species.",
+            exc,
         )
-        if not emissions_df.empty:
-            f.fill_from_pandas(mode="emissions", df=emissions_df)
+    if scenario_run is not None and not scenario_run.empty:
+        LOGGER.warning(
+            "FaIRv2 translated mode ignores the user's `scenarios` "
+            "input in v1 (RCMIP defaults are used instead). Use "
+            "native-calibration mode if you need scenario-driven "
+            "emissions on top of a calibration."
+        )
 
     try:
         f.run(progress=False, suppress_warnings=True)
@@ -309,12 +345,32 @@ def _run_one_calibration(  # noqa: PLR0913
 
     species, properties = read_properties(filename=calibration.file("species_configs"))
 
+    # Config labels MUST match the row labels in the calibration CSV;
+    # FaIR's override_defaults uses self.configs to index into the
+    # parameter file via df_configs.loc[config, col], which is type-
+    # sensitive. Pass the parameter DataFrame's index values through
+    # with their native dtype (typically int seed labels for the
+    # AR7-relevant fair-calibrate bundles).
     f = fair2.FAIR()
     f.define_time(start_year, end_year, 1)
     f.define_scenarios(scenario_names)
-    f.define_configs([f"config_{i}" for i in members.index])
+    f.define_configs(list(members.index))
     f.define_species(species, properties)
     f.allocate()
+
+    # allocate() leaves temperature / forcing / concentration arrays
+    # as NaN. FaIR's run() integrates forward from year 0 (1750) using
+    # values from the previous timestep, so the NaN at t=0 propagates
+    # to every subsequent timestep and the whole simulation comes out
+    # NaN. Initialise the state variables to zero before populating
+    # inputs and running.
+    from fair.interface import initialise
+
+    initialise(f.temperature, 0)
+    initialise(f.forcing, 0)
+    initialise(f.concentration, 0)
+    initialise(f.cumulative_emissions, 0)
+    initialise(f.airborne_emissions, 0)
 
     # Populate species configs and override defaults from the calibration
     # bundle. The override step writes the per-member parameter posterior
@@ -350,6 +406,10 @@ def _run_one_calibration(  # noqa: PLR0913
         if not emissions_df.empty:
             f.fill_from_pandas(mode="emissions", df=emissions_df)
 
+    # Natural (solar / volcanic) forcings live in separate CSVs in the
+    # bundle and use a forcing-mode input rather than emissions.
+    _fill_natural_forcings(f, calibration)
+
     f.run(progress=False, suppress_warnings=True)
 
     return extract_outputs(
@@ -360,3 +420,123 @@ def _run_one_calibration(  # noqa: PLR0913
         run_id_offset,
         properties_df=getattr(f, "properties_df", None),
     )
+
+
+# SCIENTIFIC CHOICE: which column of the multi-scenario land_use /
+# irrigation forcing CSVs to use. The bundle ships these forcings for
+# several CMIP7 climate-target categories (VL, LN, L, ML, M, H, HL);
+# we pick "M" (medium) as a sensible default. Will be made configurable
+# (probably via a per-cfg key like `land_use_forcing_scenario`) when a
+# real use case demands a specific mapping from user scenario names
+# (e.g. ssp245) to these categories.
+_DEFAULT_LAND_USE_SCENARIO = "M"
+
+
+def _fill_natural_forcings(f, calibration: NativeFairCalibration) -> None:
+    """
+    Populate FaIR's forcing arrays for the bundle's forcing-input species.
+
+    Solar, Volcanic, Land use, and Irrigation are forcing-input species
+    in the v1.6.0 calibration bundle (the species_configs CSV overrides
+    Land use and Irrigation from FaIR's default ``calculated`` mode to
+    ``forcing`` mode). They bypass ``fill_from_pandas``'s emissions
+    path, so we read each bundle CSV, reindex onto FaIR's timebounds,
+    broadcast across scenario / config, and write into ``f.forcing``
+    via ``fair.interface.fill``.
+
+    The Solar and Volcanic CSVs are simple year + value; the
+    Land use and Irrigation CSVs ship several CMIP7-target columns
+    (VL, LN, L, ML, M, H, HL) and we pick ``_DEFAULT_LAND_USE_SCENARIO``
+    (currently ``"M"``) with a warning.
+
+    Missing CSVs leave the arrays at their default (zero) baseline.
+    """
+    import numpy as np
+
+    from fair.interface import fill
+
+    n_t = len(f.timebounds)
+    n_scen = len(f.scenarios)
+    n_cfg = len(f.configs)
+
+    def _write(species_name, series):
+        # Reindex onto FaIR's timebounds and fill missing as zero.
+        series = series.reindex(f.timebounds).fillna(0.0)
+        broadcasted = np.broadcast_to(
+            series.values[:, None, None], (n_t, n_scen, n_cfg)
+        )
+        fill(f.forcing, broadcasted, specie=species_name)
+
+    # Single-column long-form CSVs (Solar, Volcanic).
+    single_col = {
+        "Solar": ("solar_forcing", "solar_erf"),
+        "Volcanic": ("volcanic_forcing", "volcanic_erf"),
+    }
+    for species_name, (bundle_key, value_col_prefix) in single_col.items():
+        csv_path = calibration.file(bundle_key)
+        if csv_path is None:
+            LOGGER.warning(
+                "Calibration bundle is missing %s; FaIR will use the "
+                "default zero baseline for %s forcing.",
+                calibration.FILES[bundle_key],
+                species_name,
+            )
+            continue
+        df = pd.read_csv(csv_path)
+        year_col = next((c for c in df.columns if c.lower() == "year"), None)
+        value_col = next(
+            (c for c in df.columns if c.lower().startswith(value_col_prefix)),
+            None,
+        )
+        if year_col is None or value_col is None:
+            LOGGER.warning(
+                "Unexpected layout for %s; expected year + %s_* columns, "
+                "got %s. %s forcing left at default.",
+                csv_path,
+                value_col_prefix,
+                list(df.columns),
+                species_name,
+            )
+            continue
+        _write(species_name, df.set_index(year_col)[value_col])
+
+    # Multi-column per-scenario CSVs (Land use, Irrigation). First
+    # column is the year index (unnamed); remaining columns are
+    # CMIP7-target categories.
+    multi_col = {
+        "Land use": "land_use_forcing",
+        "Irrigation": "irrigation_forcing",
+    }
+    for species_name, bundle_key in multi_col.items():
+        csv_path = calibration.file(bundle_key)
+        if csv_path is None:
+            LOGGER.warning(
+                "Calibration bundle is missing %s; FaIR will use the "
+                "default zero baseline for %s forcing.",
+                calibration.FILES[bundle_key],
+                species_name,
+            )
+            continue
+        df = pd.read_csv(csv_path, index_col=0)
+        choice = _DEFAULT_LAND_USE_SCENARIO
+        if choice not in df.columns:
+            LOGGER.warning(
+                "Bundle %s does not contain column %r; falling back to "
+                "the first available column %r. %s forcing will reflect "
+                "that choice. Override coming in a follow-up.",
+                csv_path,
+                choice,
+                df.columns[0],
+                species_name,
+            )
+            choice = df.columns[0]
+        else:
+            LOGGER.info(
+                "Using %s column %r from %s for %s forcing (scientific "
+                "choice; configurable in a follow-up).",
+                csv_path.name,
+                choice,
+                bundle_key,
+                species_name,
+            )
+        _write(species_name, df[choice])

@@ -127,7 +127,7 @@ def test_build_emissions_df_bundle_only_relabels_scenarios(tmp_path):
     co2_ssp126 = df[
         (df["scenario"] == "ssp126") & (df["variable"] == "CO2 FFI")
     ].iloc[0]
-    assert co2_ssp126[2000] == pytest.approx(25.0)
+    assert co2_ssp126["2000"] == pytest.approx(25.0)
 
 
 def test_build_emissions_df_user_overrides_bundle_in_overlap(tmp_path):
@@ -144,17 +144,17 @@ def test_build_emissions_df_user_overrides_bundle_in_overlap(tmp_path):
         (df["scenario"] == "ssp126") & (df["variable"] == "CO2 FFI")
     ].iloc[0]
     # Pre-user year stays bundle: 1990 = 22.0
-    assert co2_ssp126[1990] == pytest.approx(22.0)
+    assert co2_ssp126["1990"] == pytest.approx(22.0)
     # Overlap year overridden by user: 2010 = 35.0 (bundle was 33.0)
-    assert co2_ssp126[2010] == pytest.approx(35.0)
+    assert co2_ssp126["2010"] == pytest.approx(35.0)
     # Beyond-bundle year present from user: 2020 = 40.0
-    assert co2_ssp126[2020] == pytest.approx(40.0)
+    assert co2_ssp126["2020"] == pytest.approx(40.0)
 
     # CH4 (no user override) untouched
     ch4_ssp126 = df[
         (df["scenario"] == "ssp126") & (df["variable"] == "CH4")
     ].iloc[0]
-    assert ch4_ssp126[2010] == pytest.approx(340.0)
+    assert ch4_ssp126["2010"] == pytest.approx(340.0)
 
 
 def test_build_emissions_df_uses_user_unit(tmp_path):

@@ -105,10 +105,16 @@ class NativeFairCalibration:
         """
         The calibrated parameter posterior, one row per ensemble member.
 
-        Cached on first access.
+        The first column of the CSV is the per-member config label
+        (typically a random seed). We read it as the DataFrame index
+        so the index matches what :meth:`fair.FAIR.override_defaults`
+        expects: it iterates ``self.configs`` and looks each one up as
+        a row label in this DataFrame. Cached on first access.
         """
         if self._parameters_cache is None:
-            self._parameters_cache = pd.read_csv(self.file("parameters"))
+            self._parameters_cache = pd.read_csv(
+                self.file("parameters"), index_col=0
+            )
         return self._parameters_cache
 
     @property

@@ -47,9 +47,18 @@ def test_fair2_raises_when_fair_not_installed():
 
 
 def _make_bundle(tmp_path: Path, missing=()) -> Path:
-    """Build a minimal bundle directory; optionally omit named files."""
+    """
+    Build a minimal bundle directory; optionally omit named files.
+
+    The parameters CSV uses the real bundle's shape: the first column
+    is unnamed and contains config labels (FaIR's override_defaults
+    looks them up there), and subsequent columns are FaIR parameter
+    names.
+    """
     files = {
-        "calibrated_constrained_parameters.csv": "seed,climate_sensitivity\n0,3.0\n1,2.5\n",
+        "calibrated_constrained_parameters.csv": (
+            ",climate_sensitivity\n100,3.0\n200,2.5\n"
+        ),
         "species_configs_properties.csv": "name,partition_fraction\nCO2,1.0\n",
     }
     for filename, contents in files.items():
@@ -81,7 +90,11 @@ def test_native_calibration_loads_parameters(tmp_path):
     _make_bundle(tmp_path)
     cal = NativeFairCalibration(tmp_path)
     assert cal.n_members == 2
-    assert list(cal.parameters.columns) == ["seed", "climate_sensitivity"]
+    # The first CSV column is the row index (config label); the rest
+    # are the actual parameters.
+    assert list(cal.parameters.columns) == ["climate_sensitivity"]
+    # Index carries the config labels from the CSV's first column.
+    assert list(cal.parameters.index) == [100, 200]
 
 
 def test_native_calibration_select_members_all(tmp_path):
@@ -96,7 +109,10 @@ def test_native_calibration_select_members_indices(tmp_path):
     cal = NativeFairCalibration(tmp_path)
     out = cal.select_members([1])
     assert len(out) == 1
-    assert out.iloc[0]["seed"] == 1
+    # Row 1 in the CSV (zero-based positional) is the second member,
+    # whose config label is 200 (from the test fixture above).
+    assert out.iloc[0]["climate_sensitivity"] == 2.5
+    assert out.index[0] == 200
 
 
 def test_native_calibration_select_members_empty_raises(tmp_path):
