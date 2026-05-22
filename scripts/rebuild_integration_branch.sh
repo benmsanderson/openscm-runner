@@ -32,6 +32,7 @@ BRANCHES=(
   modernisation/worker-counts
   modernisation/netcdf-writer
   modernisation/fair2-adapter
+  modernisation/ciceroscmpy2-adapter
 )
 
 INTEGRATION_BRANCH="modernisation/integration"
