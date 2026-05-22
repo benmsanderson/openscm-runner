@@ -11,7 +11,7 @@ from subprocess import CalledProcessError  # nosec
 
 import scmdata
 
-from ...settings import config
+from ...settings import config, get_worker_count
 from ..utils._parallel_process import _parallel_process
 from ._compat import f90nml, pymagicc
 from ._magicc_instances import _MagiccInstances
@@ -211,9 +211,7 @@ def run_magicc_parallel(
             for cfg in cfgs
         ]
 
-        max_workers = int(
-            config.get("MAGICC_WORKER_NUMBER", multiprocessing.cpu_count())
-        )
+        max_workers = get_worker_count("MAGICC_WORKER_NUMBER")
         LOGGER.info("Running in parallel with up to %d workers", max_workers)
         pool = ProcessPoolExecutor(  # need to handle shared_manager too
             max_workers=max_workers,
