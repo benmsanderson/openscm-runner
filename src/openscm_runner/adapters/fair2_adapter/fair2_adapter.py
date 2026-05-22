@@ -51,33 +51,10 @@ from scmdata import ScmRun, run_append
 
 from ..base import _Adapter
 from ._compat import HAS_FAIR2, fair2
+from ._emissions_translator import build_emissions_df
 from ._native_calibration import NativeFairCalibration
 
 LOGGER = logging.getLogger(__name__)
-
-
-# Minimal openscm-runner variable name -> FaIR 2.x species name map.
-# Extends in follow-up PRs; documented limit on the adapter for the
-# v1 cut. Suffix-match on the openscm-runner variable so callers can
-# use the full hierarchical names ("Emissions|CO2|MAGICC Fossil and
-# Industrial") interchangeably with the leaf.
-_EMISSIONS_TO_FAIR2_SPECIES = {
-    "|CO2|MAGICC Fossil and Industrial": "CO2 FFI",
-    "|CO2|MAGICC AFOLU": "CO2 AFOLU",
-    "|CH4": "CH4",
-    "|N2O": "N2O",
-}
-
-
-def _openscm_to_fair2_species(variable: str) -> str | None:
-    """
-    Map an openscm-runner emissions variable name to a FaIR 2.x species
-    name, or ``None`` if the species is not in the v1 mapping.
-    """
-    for suffix, species in _EMISSIONS_TO_FAIR2_SPECIES.items():
-        if variable.endswith(suffix):
-            return species
-    return None
 
 
 class FAIR2(_Adapter):
@@ -212,53 +189,38 @@ def _run_one_calibration(  # noqa: PLR0913
     f.fill_species_configs(filename=calibration.file("species_configs"))
     f.override_defaults(calibration.file("parameters"))
 
-    # Future-emissions translation from the user's ScmRun is intentionally
-    # minimal in this v1: only the four main GHGs (see
-    # _EMISSIONS_TO_FAIR2_SPECIES). Anything else is left at the FaIR
-    # default. Unmapped species are logged so the user knows what is
-    # being ignored.
-    if scenario_run is not None and not scenario_run.empty:
-        _populate_emissions_from_scmrun(f, scenario_run)
+    # Splice the bundle's historical emissions with the user's scenario
+    # data and let FaIR ingest the combined frame. Bundle historical
+    # provides the baseline for every user scenario; user values
+    # overwrite per-year where supplied. Species the user does not
+    # provide (and species not in OPENSCM_TO_FAIR2_SPECIES) stay at
+    # bundle-historical values for the historical period; FaIR's
+    # interpolator handles missing future years by leaving NaN, which
+    # the model treats as zero forcing for those species.
+    bundle_emissions_csv = calibration.file("historical_emissions")
+    if bundle_emissions_csv is None:
+        LOGGER.warning(
+            "Calibration bundle at %s does not contain %s. The user's "
+            "scenario data will be passed straight through to FaIR; "
+            "FaIR's interpolator will leave NaN for years the user did "
+            "not cover.",
+            calibration.path,
+            calibration.FILES["historical_emissions"],
+        )
+
+    if bundle_emissions_csv is not None or (
+        scenario_run is not None and not scenario_run.empty
+    ):
+        emissions_df = build_emissions_df(
+            scenario_run, bundle_emissions_csv, scenario_names
+        )
+        if not emissions_df.empty:
+            f.fill_from_pandas(mode="emissions", df=emissions_df)
 
     f.run(progress=False, suppress_warnings=True)
 
     return _extract_outputs(
         f, scenario_names, members, output_variables, run_id_offset
-    )
-
-
-def _populate_emissions_from_scmrun(f, scmrun: ScmRun):
-    """
-    Write the user's scenario emissions into FaIR's emissions array
-    for the species this adapter knows how to map.
-
-    Anything not in the v1 mapping is logged at WARNING and skipped;
-    FaIR's bundle-provided historical / default values are used for
-    those species.
-    """
-    mapped, unmapped = {}, set()
-    for variable in scmrun.get_unique_meta("variable"):
-        species = _openscm_to_fair2_species(variable)
-        if species is None:
-            unmapped.add(variable)
-        else:
-            mapped.setdefault(species, variable)
-
-    if unmapped:
-        LOGGER.warning(
-            "FaIRv2 adapter v1 only maps a subset of emissions species "
-            "(%s). Unmapped variables, FaIR defaults will be used: %s",
-            sorted(_EMISSIONS_TO_FAIR2_SPECIES.values()),
-            sorted(unmapped),
-        )
-
-    # NOTE: actual ScmRun -> FaIR DataArray write goes here. Kept as a
-    # placeholder for the v1 PR while we work out the unit and time-
-    # axis details against a real run. The shape is documented and
-    # tested via mocking so the rest of the adapter wiring is verified.
-    LOGGER.debug(
-        "FaIRv2 emissions mapping (placeholder, v1): %s",
-        {k: v for k, v in mapped.items()},
     )
 
 
