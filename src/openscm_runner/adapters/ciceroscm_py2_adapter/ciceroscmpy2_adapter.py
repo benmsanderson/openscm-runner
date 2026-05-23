@@ -411,6 +411,172 @@ def _load_natemis_dataframe(path: str, component: str, nystart: int):
     )
 
 
+def _cicero_unit_to_pint(cicero_unit_raw: str, cicero_species: str) -> str:
+    """
+    Translate a CICERO gaspam EM_UNIT token to an openscm-units string.
+
+    Mirrors :meth:`COMMONSFILEWRITER.initialize_units_comps` (the
+    v1.1.x adapter's shared helper) so the same per-yr unit strings
+    are used for conversion.
+
+    - ``"Pg_C"``  -> ``"PgC / yr"``  (and the CO2 / CO2_lu species
+      both use this; openscm-units handles the carbon-mass-vs-CO2
+      conversion via the carbon context)
+    - ``"Tg_N"`` for N2O is the AR-specific N2ON convention -> ``"TgN2ON / yr"``
+    - ``"Tg_SO2"``, ``"Tg_C"`` etc. -> just strip the underscore
+    - ``"Tg"`` / ``"Mt"`` / ``"Gg"`` with no underscore -> append the
+      species name (e.g. ``"Gg"`` for ``HFC125`` -> ``"GgHFC125 / yr"``)
+    """
+    if cicero_species == "N2O" and cicero_unit_raw == "Tg_N":
+        return "TgN2ON / yr"
+    if "_" in cicero_unit_raw:
+        return cicero_unit_raw.replace("_", "") + " / yr"
+    comp_str = cicero_species.replace("-", "").replace("BMB_AEROS_", "")
+    return f"{cicero_unit_raw}{comp_str} / yr"
+
+
+def _build_hybrid_emissions_data(  # noqa: PLR0913
+    scenarios,
+    scenario_name: str,
+    bundle_dir: str,
+    gases_ep: str,
+    nystart: int,
+    nyend: int,
+    emstart: int,
+):
+    """
+    Build a CICERO-format emissions DataFrame for a novel scenario.
+
+    Bundle mode normally picks `{scen}_em_{gases_ep}` from the bundle
+    directly. When a user passes a ScmRun for a scenario that has no
+    such bundle file (e.g. an AR7 IAM output), this helper overlays
+    the user's emissions on top of the bundle's ``historical_em``
+    instead, mapping openscm-runner variable names to CICERO species
+    via :data:`cicero_comp_dict` (the same mapping the v1.1.x
+    SCENARIODATAGETTER uses) and converting units through
+    openscm-units.
+
+    Returns a DataFrame indexed by year (``nystart`` to ``nyend``)
+    with CICERO species as columns, suitable for passing through to
+    CICERO via the ``emissions_data`` scendata key. Species the user
+    doesn't supply stay at the bundle's historical value (held forward
+    past the historical file's extent, since the bundle's
+    ``historical_em`` already extends to 2500 with last-value-forward
+    constant filling, this is effectively the bundle author's
+    decision).
+    """
+    import pandas as pd
+    from openscm_units import unit_registry as ureg
+
+    from ..utils.cicero_utils.make_scenario_common import cicero_comp_dict
+
+    hist_path = os.path.join(bundle_dir, f"historical_em_{gases_ep}")
+
+    # Read the file. Same parsing the v1.1.x _read_ssp245_em uses
+    # (4 header rows, tab delim, strip column-name whitespace, rename
+    # the duplicate CO2 columns to FFI / AFOLU).
+    df = (
+        pd.read_csv(
+            hist_path, delimiter="\t", index_col=0, skiprows=[1, 2, 3]
+        )
+        .rename(columns=lambda x: x.strip())
+        .astype(float)
+    )
+    df.index = df.index.astype(int)
+    # After strip(), the second CO2 column comes through as
+    # "CO2 .1" (internal space + pandas-disambiguating ".1") because
+    # the original header is " CO2 \t CO2 \t CH4 ..." - lambda strip
+    # only removes leading / trailing whitespace. Match both forms.
+    df.columns = [
+        "CO2_FF" if c == "CO2"
+        else "CO2_AFOLU" if c in ("CO2.1", "CO2 .1")
+        else c
+        for c in df.columns
+    ]
+
+    # Pull per-column units from the file's "Unit" header (row 2).
+    with open(hist_path) as fh:
+        _ = next(fh)  # Component row (we already have columns)
+        unit_line = next(fh)
+    unit_tokens = [t.strip() for t in unit_line.rstrip("\n").split("\t")]
+    column_units = dict(zip(df.columns, unit_tokens[1:]))
+
+    df = df.loc[nystart:nyend].copy()
+
+    user_filtered = scenarios.filter(scenario=scenario_name)
+    if user_filtered.empty:
+        return df
+
+    user_ts = user_filtered.timeseries(time_axis="year")
+    user_ts.columns = user_ts.columns.astype(int)
+
+    # Map CICERO short names in cicero_comp_dict to the renamed
+    # columns in df (CO2 / CO2_lu -> CO2_FF / CO2_AFOLU).
+    cicero_to_df_col = {"CO2": "CO2_FF", "CO2_lu": "CO2_AFOLU"}
+
+    overlaid: list[str] = []
+    skipped_unmapped: list[str] = []
+    for cicero_species, (openscm_suffix, factor) in cicero_comp_dict.items():
+        col = cicero_to_df_col.get(cicero_species, cicero_species)
+        if col not in df.columns:
+            continue
+        user_var = f"Emissions|{openscm_suffix}"
+        mask = user_ts.index.get_level_values("variable") == user_var
+        if not mask.any():
+            continue
+        user_row = user_ts[mask].iloc[0]
+        user_unit = user_ts[mask].index.get_level_values("unit")[0]
+        cicero_unit_pint = _cicero_unit_to_pint(
+            column_units[col], cicero_species
+        )
+        # Some species need a unit-conversion context (NOx mass-N vs
+        # mass-NO2; NH3 mass-N vs mass-NH3). openscm-units exposes
+        # these via ScmRun.convert_unit's `context` kwarg; for raw
+        # pint we activate the same registry context manager.
+        contexts = {"NOx": "NOx_conversions", "NH3": "NH3_conversions"}
+        ctx = contexts.get(cicero_species)
+        try:
+            if ctx is not None:
+                with ureg.context(ctx):
+                    convfactor = (
+                        (1.0 * ureg(user_unit))
+                        .to(cicero_unit_pint)
+                        .magnitude
+                        * factor
+                    )
+            else:
+                convfactor = (
+                    (1.0 * ureg(user_unit)).to(cicero_unit_pint).magnitude
+                    * factor
+                )
+        except Exception as exc:  # pylint: disable=broad-except
+            LOGGER.warning(
+                "CICEROSCMPY2 hybrid: skipping species %s (unit "
+                "conversion %s -> %s failed: %s)",
+                cicero_species, user_unit, cicero_unit_pint, exc,
+            )
+            skipped_unmapped.append(cicero_species)
+            continue
+        for year, val in user_row.items():
+            if (
+                year in df.index
+                and year >= emstart
+                and not pd.isna(val)
+            ):
+                df.at[year, col] = val * convfactor
+        overlaid.append(cicero_species)
+
+    LOGGER.info(
+        "CICEROSCMPY2 hybrid emissions for scenario %r: overlaid "
+        "%d species from user ScmRun (%s); %d skipped on unit "
+        "errors (%s); others use bundle historical_em.",
+        scenario_name, len(overlaid), overlaid,
+        len(skipped_unmapped), skipped_unmapped,
+    )
+
+    return df
+
+
 def _build_scendata_list_bundle(
     scenarios, cfg: dict[str, Any]
 ) -> list[dict[str, Any]]:
@@ -473,13 +639,54 @@ def _build_scendata_list_bundle(
 
     scendata_list: list[dict[str, Any]] = []
     for scenario_name in scenario_names:
-        em_path = cfg.get("emissions_file") or _pick_bundle_file(
-            bundle_dir,
-            [
-                f"{scenario_name}_em_{gases_ep}",
-                f"historical_em_{gases_ep}",
-            ],
+        # Emissions resolution. Order of precedence:
+        #   1. Explicit cfg["emissions_file"] override
+        #   2. Bundle's own `{scen}_em_{gases_ep}` (canonical RCMIP scenario)
+        #   3. User ScmRun for this scenario, spliced onto bundle's
+        #      `historical_em` -> "hybrid mode" for novel / IAM-output
+        #      scenarios with no bundle file
+        #   4. `historical_em` as a last-resort fallback (constant
+        #      after the historical end year)
+        em_override = cfg.get("emissions_file")
+        bundle_scen_em = os.path.join(
+            bundle_dir, f"{scenario_name}_em_{gases_ep}"
         )
+        use_hybrid = (
+            em_override is None
+            and not os.path.exists(bundle_scen_em)
+            and scenarios is not None
+            and not scenarios.empty
+            and scenario_name in set(scenarios["scenario"])
+        )
+        em_path = None
+        em_data = None
+        if em_override is not None:
+            em_path = em_override
+        elif use_hybrid:
+            em_data = _build_hybrid_emissions_data(
+                scenarios=scenarios,
+                scenario_name=scenario_name,
+                bundle_dir=bundle_dir,
+                gases_ep=gases_ep,
+                nystart=nystart,
+                nyend=nyend,
+                emstart=emstart,
+            )
+            LOGGER.info(
+                "CICEROSCMPY2 bundle mode: scenario %r has no bundle "
+                "file; built hybrid emissions DataFrame by overlaying "
+                "user ScmRun on top of historical_em_%s.",
+                scenario_name,
+                gases_ep,
+            )
+        else:
+            em_path = _pick_bundle_file(
+                bundle_dir,
+                [
+                    f"{scenario_name}_em_{gases_ep}",
+                    f"historical_em_{gases_ep}",
+                ],
+            )
         conc_path = cfg.get("concentrations_file") or _pick_bundle_file(
             bundle_dir,
             [
@@ -517,7 +724,6 @@ def _build_scendata_list_bundle(
             "idtm": 24,
             "scenname": scenario_name,
             "gaspam_file": gaspam_file,
-            "emissions_file": em_path,
             "concentrations_file": conc_path,
             "rf_solar_file": sun_path,
             "rf_volc_file": volc_path,
@@ -525,6 +731,13 @@ def _build_scendata_list_bundle(
             "nat_ch4_data": nat_ch4_df.loc[: min(nyend, nat_ch4_df.index.max())],
             "nat_n2o_data": nat_n2o_df.loc[: min(nyend, nat_n2o_df.index.max())],
         }
+        # CICERO's InputHandler accepts either `emissions_file` (path)
+        # or `emissions_data` (in-memory DataFrame). Hybrid mode produces
+        # the DataFrame directly to avoid writing a temp file.
+        if em_data is not None:
+            scendata["emissions_data"] = em_data
+        else:
+            scendata["emissions_file"] = em_path
         LOGGER.debug(
             "CICEROSCMPY2 bundle scendata for scenario=%s years=%d-%d "
             "(emstart=%d) em=%s conc=%s",
@@ -532,7 +745,7 @@ def _build_scendata_list_bundle(
             nystart,
             nyend,
             emstart,
-            os.path.basename(em_path),
+            "<hybrid-DataFrame>" if em_path is None else os.path.basename(em_path),
             os.path.basename(conc_path),
         )
         scendata_list.append(scendata)
