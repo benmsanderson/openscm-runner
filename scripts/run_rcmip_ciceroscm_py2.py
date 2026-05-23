@@ -1,4 +1,4 @@
-"""
+r"""
 RCMIP protocol run: all available SSPs through the CICEROSCMPY2 adapter.
 
 Mirror of ``scripts/run_rcmip_fair2.py`` for the CICEROSCMPY2 (native
@@ -8,6 +8,19 @@ ssp126, ssp245, ssp370 and variants, ssp434, ssp460, ssp534-over,
 ssp585) against ``--members`` posterior members of a CICERO-SCM v2.x
 parameter distribution and prints a per-scenario 2100 GSAT / CO2 / ERF
 summary.
+
+**Bundle mode is the default**. If
+``$CICEROSCMPY2_BUNDLE_DIR/rcmip-march2026/`` exists the script
+points the adapter at it (the Marit RCMIP-aligned input set the
+``draw_samples_500`` posterior was actually fit against); the
+adapter's ``_build_scendata_list_bundle`` reproduces Marit's
+``run_full_rcmip_protocol.py`` bit-exactly on that input.
+
+Splice mode is only used as a fallback if the RCMIP bundle dir is
+missing, and the script + adapter both warn that splice mode carries
+a ~0.3-0.5 K present-day warm bias because the v1.1.x-bundled ssp245
+historical does not match v2.x calibrations. Pass
+``--cicero-bundle-dir`` to point at a non-standard bundle location.
 
 Results are kept in memory; ``ScmRun.to_nc`` currently breaks on
 pandas 3.0 (see ``openscm_runner._scmdata_patches`` in PR #11 for
@@ -22,23 +35,26 @@ Usage
     pip install -e ".[ciceroscmpy2]"
 
     # The bundle directory must contain:
-    #   - draw_samples_500.json          (posterior; one cfg dict per member)
-    #   - gases_vupdate_2022_AR6.txt     (gas definitions)
-    #   - ssp245_conc_RCMIP.txt          (historical concentrations)
+    #   - draw_samples_500.json   (posterior; one cfg dict per member)
+    #   - rcmip-march2026/        (Marit RCMIP-aligned input bundle —
+    #                              the default for bundle mode)
+    # If only the JSON is present and rcmip-march2026/ is absent, the
+    # script falls back to splice mode; the splice mode also requires:
+    #   - gases_vupdate_2022_AR6.txt
+    #   - ssp245_conc_RCMIP.txt
     export CICEROSCMPY2_BUNDLE_DIR=$PWD/configurations/ciceroscm
 
-    # Smoke run (20 members, default):
+    # Smoke run (20 members, default; auto-picks bundle mode):
     python scripts/run_rcmip_ciceroscm_py2.py
 
     # Larger ensemble:
     python scripts/run_rcmip_ciceroscm_py2.py --members 100
 
-Use ``--scenarios ssp245 ssp585`` to subset.
+    # Custom bundle location:
+    python scripts/run_rcmip_ciceroscm_py2.py \\
+        --cicero-bundle-dir /path/to/some/other/marit-rcmip-bundle
 
-A ``--cicero-bundle-dir`` override switches the adapter to bundle
-mode (the Marit RCMIP-aligned path); when given, ``gaspam_file`` and
-``concentrations_file`` are resolved per-scenario from inside the
-bundle directory instead of from the top-level bundle files.
+Use ``--scenarios ssp245 ssp585`` to subset.
 """
 from __future__ import annotations
 
@@ -78,17 +94,16 @@ def main(argv=None) -> int:
         "gaspam_file": bundle_dir / "gases_vupdate_2022_AR6.txt",
         "concentrations_file": bundle_dir / "ssp245_conc_RCMIP.txt",
     }
-    missing = [str(p) for p in required.values() if not p.exists()]
-    if missing:
+    # Only the distribution JSON is unconditionally required. The
+    # gaspam_file / concentrations_file pair is required only when the
+    # script ends up in splice mode (no RCMIP bundle dir and the user
+    # didn't pass --cicero-bundle-dir).
+    if not required["distribution_json"].exists():
         print(
-            "ERROR: missing CICEROSCMPY2 bundle files:\n  "
-            + "\n  ".join(missing),
-            file=sys.stderr,
-        )
-        print(
-            "\nSet CICEROSCMPY2_BUNDLE_DIR to a directory containing "
-            "draw_samples_500.json, gases_vupdate_2022_AR6.txt, and "
-            "ssp245_conc_RCMIP.txt.",
+            f"ERROR: CICEROSCMPY2 distribution JSON not at "
+            f"{required['distribution_json']}\n"
+            "Set CICEROSCMPY2_BUNDLE_DIR to a directory containing "
+            "draw_samples_500.json.",
             file=sys.stderr,
         )
         return 1
@@ -123,13 +138,47 @@ def main(argv=None) -> int:
         "distribution_json": str(required["distribution_json"]),
         "member_indices": range(args.members),
     }
-    if args.cicero_bundle_dir is not None:
-        cfg["cicero_bundle_dir"] = str(args.cicero_bundle_dir)
-        mode = f"bundle ({args.cicero_bundle_dir})"
+    cicero_bundle_dir = args.cicero_bundle_dir
+    if cicero_bundle_dir is None:
+        # Default to the standard Marit-RCMIP-aligned subdirectory of
+        # the bundle dir; fall back to splice mode (with its known
+        # present-day warm bias) only if that directory is absent.
+        default_rcmip = bundle_dir / "rcmip-march2026"
+        if default_rcmip.is_dir():
+            cicero_bundle_dir = default_rcmip
+    if cicero_bundle_dir is not None:
+        cfg["cicero_bundle_dir"] = str(cicero_bundle_dir)
+        mode = f"bundle ({cicero_bundle_dir})"
     else:
+        # Splice fallback: now we do require the legacy gaspam +
+        # concentrations files, since we have nothing else to feed
+        # CICEROSCM. Adapter will also emit its own warning at runtime.
+        missing_splice = [
+            str(p) for p in (
+                required["gaspam_file"], required["concentrations_file"]
+            ) if not p.exists()
+        ]
+        if missing_splice:
+            print(
+                "ERROR: bundle mode is the default, but "
+                f"{bundle_dir / 'rcmip-march2026'} does not exist and the "
+                "splice-mode fallback also lacks required files:\n  "
+                + "\n  ".join(missing_splice),
+                file=sys.stderr,
+            )
+            print(
+                "\nEither install the Marit-RCMIP-aligned bundle under "
+                f"{bundle_dir / 'rcmip-march2026'} or provide the splice "
+                "files (gases_vupdate_2022_AR6.txt + ssp245_conc_RCMIP.txt).",
+                file=sys.stderr,
+            )
+            return 1
         cfg["gaspam_file"] = str(required["gaspam_file"])
         cfg["concentrations_file"] = str(required["concentrations_file"])
-        mode = "splice (ssp245 historical + user emissions)"
+        mode = (
+            "splice — WARNING: present-day warm bias; pass "
+            "--cicero-bundle-dir to switch to bundle mode"
+        )
 
     print(
         f"CICERO-SCM-PY{CICEROSCMPY2.get_version()} RCMIP protocol run\n"

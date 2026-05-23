@@ -24,32 +24,37 @@ DistributionRun API is the path AR7-relevant CICERO Monte-Carlo runs
 take, and a translated path adds bookkeeping that is not warranted by
 any current use case.
 
-**Two input modes**
+**Two input modes — bundle mode is the recommended default**
 
-*Bundle mode* (recommended for AR7-relevant work). Set
-``cicero_bundle_dir`` to a directory laid out like Marit's
-``cscm-calibrate`` RCMIP working directory (the per-scenario
-``{scen}_em_{gases_ep}``, ``{scen}_conc_{gases_ep}``,
+*Bundle mode* **(use this for any AR7-relevant or scientifically
+defensible run)**. Set ``cicero_bundle_dir`` to a directory laid
+out like Marit's ``cscm-calibrate`` RCMIP working directory (the
+per-scenario ``{scen}_em_{gases_ep}``, ``{scen}_conc_{gases_ep}``,
 ``solar_RCMIP_{scen}_RCMIP3.txt``, ``VOLC_RCMIP_…``,
-``LUCalbedo_RCMIP_…``, plus ``natemis_CH4_…`` /
-``natemis_N2O_…`` and the gaspam). For each scenario in the user
-``scenarios`` ScmRun the adapter picks the matching files from the
-bundle, falling back to ``historical`` files when scenario-specific
-ones don't exist (the same logic ``run_full_rcmip_protocol.py``
-uses). This bypasses the v1.1.x SCENARIODATAGETTER splice entirely
-and reproduces the CICERO calibration's intended historical
-trajectory; the user's ScmRun is used only to enumerate scenario
-names and pick the end year (the bundle's scenario file is the
-source of truth for emissions).
+``LUCalbedo_RCMIP_…``, plus ``natemis_CH4_…`` / ``natemis_N2O_…``
+and the gaspam). For each scenario in the user ``scenarios``
+ScmRun the adapter picks the matching files from the bundle,
+falling back to ``historical`` files when scenario-specific ones
+don't exist (the same logic ``run_full_rcmip_protocol.py`` in
+``cscm-calibrate@ben_rcmip_sandbox`` uses). The adapter's
+``_build_scendata_list_bundle`` reproduces that reference protocol
+bit-exactly on the ``draw_samples_500`` posterior — verified
+2026-05-24 to the digit for every year of ssp119 against a 10-
+member subset of the same posterior.
 
-*Splice mode* (the original v1 behaviour). Set ``gaspam_file`` +
-``concentrations_file`` directly; the v1.1.x SCENARIODATAGETTER
-splices the user ScmRun on top of its bundled
-``ssp245_em_RCMIP.txt`` historical. Convenient for a quick run from
-an arbitrary ScmRun, but the splice biases ERF / GSAT high
-relative to AR6 observations (the bundled historical does not
-match the calibration posterior's expected forcing). Kept as a
-fallback for back-compat.
+*Splice mode* (legacy, **carries a calibration-mismatch bias —
+prefer bundle mode**). Set ``gaspam_file`` + ``concentrations_file``
+directly; the v1.1.x ``SCENARIODATAGETTER`` splices the user
+ScmRun on top of its bundled ``ssp245_em_RCMIP.txt`` historical.
+That historical is a v1.1.x-era file that does **not** match what
+modern v2.x calibrations such as ``draw_samples_500`` were fit
+against, so the calibration "sees" the wrong present-day forcing
+baseline and warming comes out 0.3-0.5 K too high. On ssp119 with
+the same 10-member subset, splice mode gives 1.85 K of 2024
+warming where bundle mode (and the reference protocol) give
+1.50 K. The adapter emits a ``LOGGER.warning`` whenever splice
+mode is invoked so the bias is not silent. Kept as a back-compat
+path for callers that have not yet migrated.
 
 **Per-cfg sidecar keys**
 
@@ -350,6 +355,22 @@ def _build_scendata_list_splice(
             "(an emissions ScmRun). Set cicero_bundle_dir to run from a "
             "pre-built bundle without user emissions instead."
         )
+
+    # Splice mode uses a v1.1.x-era ssp245 historical that does not match
+    # v2.x calibrations (e.g. draw_samples_500), so present-day warming
+    # comes out 0.3-0.5 K too high relative to bundle mode and the
+    # reference protocol. Bundle mode is the supported path for any
+    # scientifically defensible run; this warning fires once per run so
+    # the bias is not silent. See module docstring for the diagnosis.
+    LOGGER.warning(
+        "CICEROSCMPY2: running in splice mode. Splice mode overlays "
+        "user emissions on the v1.1.x-bundled ssp245 historical, which "
+        "does not match v2.x calibrations and produces a present-day "
+        "warm bias of ~0.3-0.5 K. Use bundle mode (set "
+        "`cicero_bundle_dir` to a Marit-RCMIP-aligned directory) for "
+        "any scientifically defensible run. See the CICEROSCMPY2 "
+        "adapter module docstring for details."
+    )
 
     nystart = int(cfg.get("nystart", 1750))
     scenario_years = scenarios.time_points.years()

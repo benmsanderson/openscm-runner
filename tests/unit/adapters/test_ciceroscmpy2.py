@@ -142,6 +142,65 @@ def test_ciceroscmpy2_bundle_mode_skips_splice_sidecar_validation(tmp_path):
         )
 
 
+def test_ciceroscmpy2_splice_mode_emits_present_day_bias_warning(
+    tmp_path, caplog
+):
+    """
+    Splice mode carries a documented ~0.3-0.5 K present-day warm bias
+    because the v1.1.x-bundled ssp245 historical doesn't match v2.x
+    calibrations such as draw_samples_500. The adapter must emit a
+    ``LOGGER.warning`` whenever splice mode is invoked so the bias is
+    not silent. Bundle mode must NOT emit it.
+
+    See project memory ``project-ciceroscm-historical-bias`` for the
+    diagnosis (splice mode 1.85 K vs bundle mode 1.50 K at 2024).
+    """
+    import logging
+
+    import pandas as pd
+    import scmdata
+
+    from openscm_runner.adapters.ciceroscm_py2_adapter import (
+        ciceroscmpy2_adapter,
+    )
+    from openscm_runner.adapters.ciceroscm_py2_adapter.ciceroscmpy2_adapter import (
+        _build_scendata_list_splice,
+    )
+
+    # Splice mode requires a real ScmRun; build a 2-year stub via
+    # scmdata so the helper's `time_points.years()` call works.
+    df = pd.DataFrame({
+        "model": ["MOD"], "scenario": ["SCN"], "region": ["World"],
+        "variable": ["Emissions|CO2"], "unit": ["Gt CO2/yr"],
+        2020: [40.0], 2021: [40.0],
+    })
+    scenarios = scmdata.ScmRun(df)
+
+    with caplog.at_level(logging.WARNING, logger=ciceroscmpy2_adapter.__name__):
+        try:
+            _build_scendata_list_splice(scenarios, {})
+        except Exception:
+            # Helper will fail later on missing splice files; we only
+            # care that the warning fired before the failure.
+            ...
+
+    warning_records = [
+        r for r in caplog.records
+        if r.levelname == "WARNING"
+        and "splice mode" in r.getMessage()
+    ]
+    captured = [r.getMessage() for r in caplog.records]
+    assert warning_records, (
+        f"Expected a LOGGER.warning containing 'splice mode' when "
+        f"_build_scendata_list_splice runs. Got: {captured}"
+    )
+    msg = warning_records[0].getMessage()
+    assert "warm bias" in msg, f"Splice warning should flag warm bias: {msg!r}"
+    assert "bundle mode" in msg, (
+        f"Splice warning should point users at bundle mode: {msg!r}"
+    )
+
+
 def test_ciceroscmpy2_rejects_empty_member_indices(tmp_path):
     """
     An explicit empty member_indices is almost certainly a user

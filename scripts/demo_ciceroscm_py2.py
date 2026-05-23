@@ -2,16 +2,23 @@
 End-to-end demonstration of the CICEROSCMPY2 adapter.
 
 Runs the CICEROSCMPY2 adapter against a CICERO-SCM v2.1.0 parameter
-distribution and prints a 2100 GSAT summary across the ensemble. The
-distribution + supporting input files live under
-``configurations/ciceroscm/`` by convention:
+distribution in **bundle mode** (the path that bit-exactly reproduces
+Marit's reference RCMIP protocol) and prints a 2100 GSAT summary
+across the ensemble.
+
+Bundle mode is the recommended path. The previously-shipped splice
+mode uses a v1.1.x-era ssp245 historical that does not match v2.x
+calibrations and produces a ~0.3-0.5 K present-day warm bias —
+see the adapter module docstring for the diagnosis.
+
+Layout expected under ``configurations/ciceroscm/``:
 
 - ``draw_samples_500.json`` -- the parameter posterior (one
   ``{pamset_udm, pamset_emiconc, ...}`` dict per ensemble member).
-- ``gases_vupdate_2022_AR6.txt`` -- gas definitions (molecular
-  weights, lifetimes, radiative properties).
-- ``ssp245_conc_RCMIP.txt`` -- historical concentrations covering
-  ``nystart`` to ``emstart``.
+- ``rcmip-march2026/`` -- Marit-RCMIP-aligned bundle directory
+  containing per-scenario ``{scen}_em_*``, ``{scen}_conc_*``,
+  ``solar_RCMIP_*``, ``VOLC_RCMIP_*``, ``LUCalbedo_RCMIP_*``,
+  ``natemis_CH4_*``, ``natemis_N2O_*`` files plus the gaspam.
 
 Usage:
 
@@ -25,14 +32,17 @@ Usage:
 
 Optional knobs (env vars):
 
-- ``CICEROSCMPY2_BUNDLE_DIR``   directory with the JSON + gaspam +
-                                 concentrations files (default
-                                 ``configurations/ciceroscm/``).
-- ``CICEROSCMPY2_DEMO_MEMBERS`` how many ensemble members to use
-                                 (default ``10``; pass ``500`` to run
-                                 the full posterior).
-- ``CICEROSCMPY2_DEMO_SCENARIO`` which built-in fixture scenario to
-                                  load (default ``ssp245``).
+- ``CICEROSCMPY2_BUNDLE_DIR``       directory holding
+                                     ``draw_samples_500.json`` (default
+                                     ``configurations/ciceroscm/``).
+- ``CICEROSCMPY2_RCMIP_BUNDLE_DIR`` Marit-RCMIP-aligned bundle
+                                     directory (default
+                                     ``$CICEROSCMPY2_BUNDLE_DIR/rcmip-march2026``).
+- ``CICEROSCMPY2_DEMO_MEMBERS``     how many ensemble members to use
+                                     (default ``10``; pass ``500`` to
+                                     run the full posterior).
+- ``CICEROSCMPY2_DEMO_SCENARIO``    which built-in fixture scenario to
+                                     load (default ``ssp245``).
 """
 from __future__ import annotations
 
@@ -48,30 +58,36 @@ from openscm_runner.adapters import CICEROSCMPY2
 
 
 def main() -> int:
+    """Run the CICEROSCMPY2 bundle-mode demo; return process exit code."""
     bundle_dir = Path(
         os.environ.get(
             "CICEROSCMPY2_BUNDLE_DIR",
             Path(__file__).parent.parent / "configurations" / "ciceroscm",
         )
     )
+    rcmip_bundle_dir = Path(
+        os.environ.get(
+            "CICEROSCMPY2_RCMIP_BUNDLE_DIR",
+            bundle_dir / "rcmip-march2026",
+        )
+    )
 
-    required = {
-        "distribution_json": bundle_dir / "draw_samples_500.json",
-        "gaspam_file": bundle_dir / "gases_vupdate_2022_AR6.txt",
-        "concentrations_file": bundle_dir / "ssp245_conc_RCMIP.txt",
-    }
-    missing = [str(p) for p in required.values() if not p.exists()]
-    if missing:
+    distribution_json = bundle_dir / "draw_samples_500.json"
+    if not distribution_json.exists():
         print(
-            "ERROR: missing CICEROSCMPY2 bundle files:\n  "
-            + "\n  ".join(missing),
+            f"ERROR: CICEROSCMPY2 distribution JSON not at {distribution_json}",
+            file=sys.stderr,
+        )
+        return 1
+    if not rcmip_bundle_dir.is_dir():
+        print(
+            f"ERROR: CICEROSCMPY2 RCMIP bundle dir not at {rcmip_bundle_dir}",
             file=sys.stderr,
         )
         print(
-            "\nPoint CICEROSCMPY2_BUNDLE_DIR at a directory containing "
-            "draw_samples_500.json, gases_vupdate_2022_AR6.txt, and "
-            "ssp245_conc_RCMIP.txt, or copy them into "
-            "configurations/ciceroscm/.",
+            "\nThe bundle is too large to ship in-tree; obtain it from the "
+            "CICERO RCMIP setup (Marit's cscm-calibrate working directory) "
+            "and point CICEROSCMPY2_RCMIP_BUNDLE_DIR at it.",
             file=sys.stderr,
         )
         return 1
@@ -101,17 +117,17 @@ def main() -> int:
         return 1
 
     print(
-        f"Running CICERO-SCM-PY{CICEROSCMPY2.get_version()} with {n_members} "
-        f"members from {required['distribution_json']}, scenario {scenario_name}"
+        f"Running CICERO-SCM-PY{CICEROSCMPY2.get_version()} bundle mode "
+        f"with {n_members} members from {distribution_json}, "
+        f"scenario {scenario_name} (bundle: {rcmip_bundle_dir})"
     )
 
     result = openscm_runner.run.run(
         climate_models_cfgs={
             "CICERO-SCM-PY2": [
                 {
-                    "distribution_json": str(required["distribution_json"]),
-                    "gaspam_file": str(required["gaspam_file"]),
-                    "concentrations_file": str(required["concentrations_file"]),
+                    "distribution_json": str(distribution_json),
+                    "cicero_bundle_dir": str(rcmip_bundle_dir),
                     "member_indices": range(n_members),
                 }
             ],
