@@ -8,7 +8,10 @@ import pandas as pd
 import pytest
 
 from openscm_runner.scenarios import CANONICAL_VARIABLES, load_iamc
-from openscm_runner.scenarios.iamc_loader import _canonicalise_variable
+from openscm_runner.scenarios.iamc_loader import (
+    _canonicalise_unit,
+    _canonicalise_variable,
+)
 
 
 def _write_csv(tmp_path: Path, rows: list[dict]) -> Path:
@@ -55,6 +58,44 @@ def test_canonicalise_hfc4310_rename_handles_both_spellings():
 def test_canonicalise_legacy_species_renames():
     assert _canonicalise_variable("Emissions|SOx") == "Emissions|Sulfur"
     assert _canonicalise_variable("Emissions|NMVOC") == "Emissions|VOC"
+
+
+def test_canonicalise_unit_rewrites_hfc4310_dashed_form():
+    # SCI exports HFC4310mee rows with this unit string; the dash is
+    # not a valid pint symbol character, so the loader rewrites to the
+    # RCMIP convention which openscm-units can parse.
+    assert _canonicalise_unit("kt HFC43-10/yr") == "kt HFC4310mee/yr"
+
+
+def test_canonicalise_unit_normalises_bare_hfc4310_to_mee_form():
+    assert _canonicalise_unit("kt HFC4310/yr") == "kt HFC4310mee/yr"
+
+
+def test_canonicalise_unit_does_not_double_rewrite_hfc4310mee():
+    assert _canonicalise_unit("kt HFC4310mee/yr") == "kt HFC4310mee/yr"
+
+
+def test_canonicalise_unit_legacy_renames():
+    assert _canonicalise_unit("Mt SOx/yr") == "Mt Sulfur/yr"
+    assert _canonicalise_unit("Mt NMVOC/yr") == "Mt VOC/yr"
+
+
+def test_canonicalise_unit_passes_other_strings_through():
+    assert _canonicalise_unit("Mt CO2/yr") == "Mt CO2/yr"
+    assert _canonicalise_unit("ppm") == "ppm"
+
+
+def test_load_iamc_unit_rewrite_propagates_to_scmrun(tmp_path):
+    # End-to-end: SCI-style HFC4310mee row arrives with the dashed unit,
+    # gets relabelled to the canonical variable and the canonical unit
+    # in the returned ScmRun.
+    path = _write_csv(tmp_path, [
+        _row(variable="Emissions|HFC|HFC43-10", unit="kt HFC43-10/yr",
+             **{"2020": 1.0}),
+    ])
+    run = load_iamc(path)
+    assert run["variable"].tolist() == ["Emissions|HFC4310mee"]
+    assert run["unit"].tolist() == ["kt HFC4310mee/yr"]
 
 
 def test_canonicalise_co2_sector_splits():
