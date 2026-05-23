@@ -56,15 +56,31 @@ from __future__ import annotations
 import argparse
 import fnmatch
 import logging
+import multiprocessing
 import os
+import platform
 import sys
 import time
 from pathlib import Path
 
-import pandas as pd
-import scmdata
+# macOS Python uses ``spawn`` for multiprocessing by default (since
+# ``fork`` is unsafe with Cocoa / Foundation frameworks). For our
+# CICERO pool, spawn is ~10x slower than fork on macOS because every
+# worker re-imports the parent's module set from scratch (we measured
+# 310 s vs 30 s for 20 members of a conc-driven SSP). Switching to
+# fork here is safe because the runner is a pure-Python script that
+# doesn't touch any macOS GUI frameworks. Opt out by setting
+# ``CICEROSCM_RUNNER_NO_FORK=1`` if you hit unexpected behaviour.
+if (
+    platform.system() == "Darwin"
+    and not os.environ.get("CICEROSCM_RUNNER_NO_FORK")
+):
+    multiprocessing.set_start_method("fork", force=True)
 
-import openscm_runner.run
+import pandas as pd  # noqa: E402
+import scmdata  # noqa: E402
+
+import openscm_runner.run  # noqa: E402
 
 REPO = Path(__file__).parent.parent
 
