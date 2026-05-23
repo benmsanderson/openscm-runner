@@ -177,6 +177,14 @@ class CICEROSCMPY2(_Adapter):
                 "`output_config` not implemented for CICEROSCMPY2"
             )
 
+        # Surface unsupported variables up-front: upstream silently
+        # drops anything not in its reformat mapping, which means a
+        # user who asks for e.g. ``Sea Level Change`` sees an empty
+        # column rather than a clear error.
+        from ._output_variables import validate_output_variables
+
+        validate_output_variables(output_variables)
+
         from ._upstream_patches import (
             _CARBON_CYCLE_VARIABLES,
             output_vars_need_carbon_cycle,
