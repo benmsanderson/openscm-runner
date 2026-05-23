@@ -14,27 +14,83 @@ Supported output variables in this version:
 - ``Surface Air Temperature Change`` (FaIR's surface layer)
 - ``Surface Air Ocean Blended Temperature Change`` (scaled by
   ``GMST_TO_GSAT_SCALE``; documented scientific choice)
+- ``Surface Ocean Temperature Change`` (FaIR's ``temperature[layer=1]``)
 - ``Effective Radiative Forcing`` (FaIR's ``forcing_sum``)
 - ``Effective Radiative Forcing|<species>`` for every FaIR 2.x species
   with a known openscm-runner name (see
-  :data:`OUTPUT_LEAF_TO_FAIR2_SPECIES`)
-- ``Effective Radiative Forcing|<category>`` aggregations
-  (Anthropogenic, Greenhouse Gases, Kyoto Gases, F-Gases,
-  CO2/CH4/N2O, Montreal Protocol Halogen Gases, Aerosols,
-  Aerosols|Direct Effect, Aerosols|Indirect Effect, Ozone,
-  CH4 Oxidation Stratospheric H2O, Contrails, Land-use Change,
-  Black Carbon on Snow, Volcanic, Solar)
+  :data:`OUTPUT_LEAF_TO_FAIR2_SPECIES`). RCMIP hierarchical paths
+  (``…|Anthropogenic|F-Gases|HFC|HFC125``) resolve to the same species
+  data as the flat form (``…|HFC125``) via leaf-segment lookup.
+- ``Effective Radiative Forcing|<category>`` aggregations including
+  the RCMIP-aligned hierarchy:
+  ``Anthropogenic|{CO2, CH4, F-Gases, F-Gases|HFC, F-Gases|PFC,
+  Montreal Gases, Montreal Gases|{CFC, HCFC, Halon}, Aerosol,
+  Aerosol|{Aerosol-radiation Interactions, Aerosol-cloud Interactions},
+  Albedo Change, Other|{Contrails, BC on Snow, CH4 Oxidation
+  Stratospheric H2O}}`` and ``Natural|{Solar, Volcanic}``.
 - ``Atmospheric Concentrations|<species>`` for every FaIR 2.x species
-  with a known openscm-runner name
+  with a known openscm-runner name (flat or hierarchical form).
+- ``Emissions|<species>`` (forward or back-calculated; FaIR's run loop
+  calls ``unstep_concentration`` per timestep for species in
+  ``concentration`` input_mode, populating ``f.emissions``).
+- ``Cumulative Emissions|<species>`` (from ``cumulative_emissions``).
+- ``Airborne Emissions|<species>`` (from ``airborne_emissions``).
+- ``Net Flux to Atmosphere|<species>`` (year-over-year diff of
+  cumulative emissions; equals the per-year emission rate).
+- ``Atmospheric Lifetime|<species>`` (``alpha_lifetime`` * baseline
+  from species_configs; in years).
 - ``Heat Content``, ``Heat Content|Ocean`` (FaIR's
   ``ocean_heat_content_change``, converted J -> ZJ)
-- ``Heat Uptake``, ``Heat Uptake|Ocean``, ``Net Energy Imbalance``
-  (FaIR's ``toa_imbalance``)
+- ``Heat Uptake``, ``Heat Uptake|Ocean`` (FaIR's ``toa_imbalance``
+  converted W/m^2 -> ZJ/yr via Earth surface area * seconds/yr)
+- ``Net Energy Imbalance`` (native W/m^2 from ``toa_imbalance``)
 - ``Airborne Fraction`` (FaIR's ``airborne_fraction`` summed over
   CO2 FFI + CO2 AFOLU)
 
-Unrecognised variables are logged at DEBUG and silently skipped, the
-same forgiving pattern the FaIR 1.6 adapter follows.
+**Variables NOT supported (FaIR 2.x structural limits)**:
+
+These are RCMIP variables that no amount of extractor work will
+expose, because FaIR 2.x's model design does not produce them:
+
+- ``Sea Level Change`` and all sub-entries (6 variables): FaIR has
+  no sea-level module.
+- ``Carbon Pool|{Land, Ocean}|{Vegetation, Litter, Soil, Wood,
+  Surface, Deep, Inorganic, Organic, ...}`` and the corresponding
+  ``Carbon Flux`` sub-entries (~30 variables): FaIR's carbon cycle
+  is a Joos-style impulse-response with no compartmental pools
+  (no land/ocean partitioning of CO2 uptake, no biosphere
+  compartments).
+- ``Natural Fluxes|CH4|{Wetland, Permafrost, Soil Sink,
+  Stratosphere, Troposphere, ...}`` and source decompositions
+  (``Emissions|CH4|{Biomass Burning, Fossil, AFOLU, Other}``):
+  FaIR models CH4 as a single species with a lumped lifetime; no
+  source-side or sink-side breakdown.
+- ``Heat Uptake|{Atmosphere, Land, Ice, Other}`` (4 variables):
+  FaIR's energy balance puts all heat into the ocean; no
+  separate non-ocean heat uptake.
+- ``Heat Content|Ocean|{0-700m, 700-2000m, below-2000m}``
+  (3 variables): FaIR's 2-layer ocean (mixed + deep box) has no
+  depth resolution within those boxes.
+- ``Effective Radiative Forcing|...|Aerosol-radiation
+  Interactions|{Biomass Burning, Fossil and Industrial}|{BC, NH3,
+  Nitrate, OC, Sulfate}`` and similar 3-way splits (~15 variables):
+  FaIR's aerosol forcing is per emission species, not partitioned
+  by emission source sector.
+- ``Natural Fluxes|N2O`` and ``Natural Fluxes|N2O|*`` (~3 variables):
+  N2O modelled as a single species; no separate natural source
+  partitioning.
+- ``Effective Radiative Forcing|Anthropogenic|{Stratospheric,
+  Tropospheric} Ozone`` and tropospheric ozone precursor splits:
+  FaIR has a lumped ``Ozone`` species (exposed) but not the
+  strat/trop split nor the precursor-attributed decomposition.
+- ``Carbon Sequestration`` (CCS): no explicit CCS module; CCS
+  fluxes appear only as a negative on the input emissions.
+- ``Ocean pH``: FaIR has no carbonate chemistry.
+
+Bottom line: ~180 of the protocol's 275 variables are reachable
+from FaIR 2.x's natural outputs; the remaining ~95 are structurally
+unsupported. Unrecognised variables are logged at DEBUG and silently
+skipped (the same forgiving pattern the FaIR 1.6 adapter follows).
 """
 from __future__ import annotations
 
