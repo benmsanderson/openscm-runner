@@ -33,7 +33,7 @@ patched scmdata is on PyPI the module (and the import-time
 pin tightened to whatever release contains the fixes.
 
 Issue tracking removal of this shim:
-https://github.com/benmsanderson/openscm-runner/issues/11
+https://github.com/benmsanderson/openscm-runner/issues/10
 """
 from __future__ import annotations
 
