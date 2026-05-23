@@ -177,6 +177,23 @@ class CICEROSCMPY2(_Adapter):
                 "`output_config` not implemented for CICEROSCMPY2"
             )
 
+        from ._upstream_patches import (
+            _CARBON_CYCLE_VARIABLES,
+            output_vars_need_carbon_cycle,
+        )
+        if output_vars_need_carbon_cycle(output_variables):
+            triggering = sorted(set(output_variables) & _CARBON_CYCLE_VARIABLES)
+            LOGGER.info(
+                "CICEROSCMPY2: output_variables include %s, which require "
+                "the CICERO-SCM carbon-cycle back-calculation. This adds "
+                "~30-50x per-member runtime on conc-driven runs (back-"
+                "calculated emissions, airborne fraction, biosphere/ocean "
+                "fluxes). Drop those variables from output_variables for "
+                "a much faster run if you only need GSAT / ERF / "
+                "concentrations.",
+                triggering,
+            )
+
         for cfg in cfgs:
             if "distribution_json" not in cfg:
                 raise ValueError(
