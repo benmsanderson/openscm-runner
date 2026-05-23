@@ -373,6 +373,7 @@ def extract_outputs(  # noqa: PLR0913, PLR0912, PLR0915
                 for prefix, extractor in (
                     ("Atmospheric Concentrations|", _atmos_conc),
                     ("Effective Radiative Forcing|", _erf_per_species),
+                    ("Emissions|", _emissions_per_species),
                 ):
                     if variable.startswith(prefix):
                         result = extractor(
@@ -417,6 +418,77 @@ def _erf_per_species(f, leaf: str, sc_idx: int, member_offset: int):
         .values
     )
     return values, "W/m^2"
+
+
+def _emissions_per_species(  # noqa: PLR0911
+    f, leaf: str, sc_idx: int, member_offset: int
+):
+    """
+    Read emissions for a species out of ``f.emissions``.
+
+    Works for both emissions-driven runs (returns the input values
+    interpolated onto FaIR's timepoints) and concentration-driven
+    runs (returns back-calculated emissions; FaIR's run loop calls
+    ``fair.gas_cycle.inverse.unstep_concentration`` per timestep
+    for species in ``concentration`` input_mode).
+
+    Special handling: ``Emissions|CO2`` is the TOTAL of FaIR's two
+    CO2 emissions species (``CO2 FFI`` + ``CO2 AFOLU``); the
+    sub-categorised leaves ``CO2|MAGICC Fossil and Industrial`` and
+    ``CO2|MAGICC AFOLU`` map to the individual species.
+
+    FaIR's emissions live on ``timepoints`` (year midpoints; length
+    n_years), while the rest of the extractor reports on
+    ``timebounds`` (year edges; length n_years + 1). We pad with a
+    trailing NaN so the output array fits the timebound grid the
+    caller uses for the resulting Series.
+    """
+    import numpy as np
+    from fair.structure.units import desired_emissions_units
+
+    def _read(spec: str):
+        if spec not in f.emissions["specie"].values:
+            return None
+        vals = (
+            f.emissions.sel(specie=spec)
+            .isel(scenario=sc_idx, config=member_offset)
+            .values
+        )
+        # Pad timepoints (length N) -> timebounds (length N+1) with NaN
+        # so the caller's pd.Series(values, index=timebounds) lines up.
+        # The final year has no emissions data; rather than fabricate
+        # a value we leave it NaN.
+        return np.concatenate([vals, [np.nan]])
+
+    # Total CO2 = FFI + AFOLU (RCMIP "Emissions|CO2" convention).
+    if leaf == "CO2":
+        ffi = _read("CO2 FFI")
+        afolu = _read("CO2 AFOLU")
+        if ffi is None or afolu is None:
+            return None
+        unit = desired_emissions_units.get("CO2 FFI", "Gt C/yr")
+        return ffi + afolu, unit
+
+    # IAMC sub-categorised CO2 paths -> individual FaIR species.
+    if leaf == "CO2|MAGICC Fossil and Industrial":
+        values = _read("CO2 FFI")
+        unit = desired_emissions_units.get("CO2 FFI", "Gt C/yr")
+        return (None if values is None else (values, unit))
+    if leaf == "CO2|MAGICC AFOLU":
+        values = _read("CO2 AFOLU")
+        unit = desired_emissions_units.get("CO2 AFOLU", "Gt C/yr")
+        return (None if values is None else (values, unit))
+
+    # Other species: same leaf-to-FaIR map the concentration / ERF
+    # extractors use.
+    species_name = OUTPUT_LEAF_TO_FAIR2_SPECIES.get(leaf)
+    if species_name is None:
+        return None
+    values = _read(species_name)
+    if values is None:
+        return None
+    unit = desired_emissions_units.get(species_name, "unknown")
+    return values, unit
 
 
 def _build_scmrun(rows, timebounds) -> ScmRun:

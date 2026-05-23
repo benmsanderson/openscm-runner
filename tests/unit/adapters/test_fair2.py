@@ -208,3 +208,28 @@ def test_fair2_translated_cfg_warns_on_unknown_parameter_names(caplog):
 
     assert "definitely_not_a_fair_parameter" in caplog.text
     assert "ignored unknown parameter names" in caplog.text
+
+
+def test_fair2_conc_driven_requires_bundle_dir(tmp_path):
+    """
+    Setting ``fair2_conc_driven=True`` without ``fair2_conc_bundle_dir``
+    is a user error - the adapter must raise immediately rather than
+    silently fall back to emissions-driven (which would silently
+    produce different physics than the user asked for).
+    """
+    adapter = FAIR2()
+    # Build a minimal bundle so the calibration loader doesn't choke
+    # before we hit the conc-driven validation.
+    _make_bundle(tmp_path)
+    with pytest.raises(ValueError, match="fair2_conc_bundle_dir"):
+        adapter._run(
+            scenarios=None,
+            cfgs=[
+                {
+                    "native_calibration": str(tmp_path),
+                    "fair2_conc_driven": True,
+                }
+            ],
+            output_variables=("Surface Air Temperature Change",),
+            output_config=None,
+        )

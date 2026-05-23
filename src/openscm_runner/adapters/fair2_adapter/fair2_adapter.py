@@ -141,6 +141,20 @@ def _run_native_cfgs(scenarios, cfgs, output_variables) -> ScmRun:
     members of all cfgs so the combined ScmRun has unique run_ids.
     """
     results = []
+    # Up-front cfg validation: catch user errors before we touch any
+    # calibration files (so the error doesn't depend on a valid
+    # bundle being available).
+    for cfg in cfgs:
+        if cfg.get("fair2_conc_driven") is True and not cfg.get(
+            "fair2_conc_bundle_dir"
+        ):
+            raise ValueError(
+                "FaIRv2 conc-driven mode requires `fair2_conc_bundle_dir` "
+                "cfg key (path to the CICERO RCMIP bundle with "
+                "`{scen}_conc_{gases_ep}` files; same bundle the "
+                "CICEROSCMPY2 adapter uses in bundle mode)."
+            )
+
     run_id_offset = 0
     for cfg_index, cfg in enumerate(cfgs):
         calibration = _resolve_calibration(cfg["native_calibration"])
@@ -162,6 +176,12 @@ def _run_native_cfgs(scenarios, cfgs, output_variables) -> ScmRun:
             members=members,
             output_variables=output_variables,
             run_id_offset=run_id_offset,
+            conc_driven=cfg.get("fair2_conc_driven"),
+            conc_bundle_dir=cfg.get("fair2_conc_bundle_dir"),
+            conc_gases_ep=cfg.get(
+                "fair2_conc_gases_ep",
+                "gases_vupdate_2024_WMO_added_new.txt",
+            ),
         )
         results.append(scmrun_chunk)
         run_id_offset += len(members)
@@ -368,6 +388,9 @@ def _run_one_calibration(  # noqa: PLR0913
     members: pd.DataFrame,
     output_variables,
     run_id_offset: int,
+    conc_driven=None,
+    conc_bundle_dir=None,
+    conc_gases_ep="gases_vupdate_2024_WMO_added_new.txt",
 ) -> ScmRun:
     """
     Run FaIR 2.x once with a single calibration choice and return the
@@ -377,6 +400,22 @@ def _run_one_calibration(  # noqa: PLR0913
     dimension. Output run_ids are ``run_id_offset + i`` so that
     concatenations across multiple calibration choices in the same
     ``run.run`` call stay unique.
+
+    Concentration-driven mode (``conc_driven=True`` and
+    ``conc_bundle_dir`` set) flips the GHG species present in the
+    bundle's concentration files from emissions/calculated input
+    mode to ``concentration``, reads their trajectories per scenario
+    via :func:`_concentrations_translator.build_concentrations_df`,
+    and feeds them to FaIR via ``fill_from_pandas(mode="concentration")``.
+    FaIR's run loop calls ``unstep_concentration`` per timestep to
+    back-calculate emissions for those species; the output extractor
+    reads them out as ``Emissions|*`` variables.
+
+    Auto-detect (``conc_driven=None``): mirrors CICEROSCMPY2's
+    convention - scenarios starting with ``esm-`` or ``methanemip``
+    run emissions-driven; everything else runs concentration-driven
+    if ``conc_bundle_dir`` is provided. With no bundle, defaults to
+    emissions-driven regardless of scenario name.
     """
     from fair.io import read_properties
 
@@ -399,6 +438,65 @@ def _run_one_calibration(  # noqa: PLR0913
     )
 
     species, properties = read_properties(filename=calibration.file("species_configs"))
+
+    # Resolve conc-driven mode + build the conc DataFrame up-front so
+    # we know which species to flip from emissions / calculated to
+    # concentration input_mode before define_species pins the species
+    # set on the FAIR instance.
+    #
+    # Auto-detect: scenarios starting with `esm-` or `methanemip` run
+    # emissions-driven (matching CICEROSCMPY2's convention); everything
+    # else runs concentration-driven WHEN a conc_bundle_dir is provided.
+    # Without a bundle, default to emissions-driven regardless.
+    conc_df = None
+    use_conc = False
+    if conc_driven is True:
+        use_conc = True
+    elif conc_driven is None and conc_bundle_dir is not None:
+        # Auto-detect from first scenario name.
+        first = scenario_names[0].lower()
+        use_conc = not first.startswith(("esm-", "esm_", "methanemip"))
+
+    if use_conc:
+        # `conc_bundle_dir is not None` is guaranteed by the cfg-level
+        # validation in _run_native_cfgs (raised before we get here).
+        from ._concentrations_translator import build_concentrations_df
+
+        conc_df = build_concentrations_df(
+            bundle_dir=conc_bundle_dir,
+            gases_ep=conc_gases_ep,
+            scenario_names=scenario_names,
+            fair_species=species,
+            nystart=start_year,
+            nyend=end_year,
+        )
+        if conc_df.empty:
+            LOGGER.warning(
+                "FaIRv2 conc-driven: empty concentrations DataFrame "
+                "from bundle %s; falling back to emissions-driven.",
+                conc_bundle_dir,
+            )
+            use_conc = False
+        else:
+            # Flip input_mode for the GHG species we're driving with
+            # concentrations. Other species (aerosols, forcing-mode
+            # natural drivers) keep their bundle-specified mode and
+            # are populated via emissions / natural-forcing inputs.
+            conc_species = set(conc_df["variable"].unique())
+            for sp_name in conc_species:
+                if sp_name in properties:
+                    properties[sp_name] = {
+                        **properties[sp_name],
+                        "input_mode": "concentration",
+                    }
+            LOGGER.info(
+                "FaIRv2 conc-driven: flipped %d species to "
+                "input_mode='concentration' (CO2, CH4, N2O, halocarbons). "
+                "FaIR will back-calculate emissions for these species via "
+                "unstep_concentration; aerosols still come from emissions "
+                "input.",
+                len(conc_species),
+            )
 
     # Config labels MUST match the row labels in the calibration CSV;
     # FaIR's override_defaults uses self.configs to index into the
@@ -460,6 +558,15 @@ def _run_one_calibration(  # noqa: PLR0913
         )
         if not emissions_df.empty:
             f.fill_from_pandas(mode="emissions", df=emissions_df)
+
+    # Fill concentrations for the species we flipped above. FaIR's
+    # run loop calls unstep_concentration per timestep to back-
+    # calculate emissions for these species (see
+    # fair.gas_cycle.inverse). Their concentration trajectories come
+    # from the bundle's per-scenario `{scen}_conc_…` files via the
+    # _concentrations_translator helper.
+    if use_conc and conc_df is not None and not conc_df.empty:
+        f.fill_from_pandas(mode="concentration", df=conc_df)
 
     # Natural (solar / volcanic) forcings live in separate CSVs in the
     # bundle and use a forcing-mode input rather than emissions.
