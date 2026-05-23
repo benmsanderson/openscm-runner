@@ -122,7 +122,7 @@ def _species_by_property(properties_df, predicate) -> list[str]:
     ]
 
 
-def _build_forcing_aggregations(  # noqa: PLR0915
+def _build_forcing_aggregations(  # noqa: PLR0912, PLR0915
     forcing_da, sc_idx: int, member_offset: int, properties_df
 ) -> "dict[str, tuple[np.ndarray, str]]":
     """
@@ -235,6 +235,89 @@ def _build_forcing_aggregations(  # noqa: PLR0915
             .values
         )
         maybe(openscm_name, values)
+
+    # RCMIP-aligned hierarchical aggregations. Most are aliases for
+    # entries we've already built above; a few (HFC, PFC, CFC, HCFC
+    # sub-totals) are new sub-sums grouped by chemistry.
+    hfcs = [s for s in species_in_run if s.startswith("HFC-")]
+    pfcs = [s for s in species_in_run if s in (
+        "CF4", "C2F6", "C3F8", "C4F10", "C5F12",
+        "C6F14", "C7F16", "C8F18", "c-C4F8",
+    )]
+    cfcs = [
+        s for s in species_in_run
+        if s.startswith("CFC-") or s in (
+            "CCl4", "CH3CCl3", "CH3Br", "CH3Cl",
+        )
+    ]
+    hcfcs = [s for s in species_in_run if s.startswith("HCFC-")]
+    halons = [s for s in species_in_run if s.startswith("Halon-")]
+
+    erf = "Effective Radiative Forcing"
+    aero_radiation = (
+        f"{erf}|Anthropogenic|Aerosol|Aerosol-radiation Interactions"
+    )
+    aero_cloud = (
+        f"{erf}|Anthropogenic|Aerosol|Aerosol-cloud Interactions"
+    )
+    strath2o = (
+        f"{erf}|Anthropogenic|Other|CH4 Oxidation Stratospheric H2O"
+    )
+    rcmip_aggregations = {
+        # Anthropogenic subcategory aliases for existing aggregations.
+        f"{erf}|Anthropogenic|F-Gases":
+            out.get(f"{erf}|F-Gases"),
+        f"{erf}|Anthropogenic|Aerosol":
+            out.get(f"{erf}|Aerosols"),
+        aero_radiation:
+            out.get(f"{erf}|Aerosols|Direct Effect"),
+        aero_cloud:
+            out.get(f"{erf}|Aerosols|Indirect Effect"),
+        f"{erf}|Anthropogenic|Montreal Gases":
+            out.get(f"{erf}|Montreal Protocol Halogen Gases"),
+        f"{erf}|Natural|Solar":
+            out.get(f"{erf}|Solar"),
+        f"{erf}|Natural|Volcanic":
+            out.get(f"{erf}|Volcanic"),
+        f"{erf}|Anthropogenic|Albedo Change|Land use":
+            out.get(f"{erf}|Land-use Change"),
+        f"{erf}|Anthropogenic|Albedo Change":
+            out.get(f"{erf}|Land-use Change"),
+        strath2o:
+            out.get(f"{erf}|CH4 Oxidation Stratospheric H2O"),
+        f"{erf}|Anthropogenic|Other|Contrails":
+            out.get(f"{erf}|Contrails"),
+        f"{erf}|Anthropogenic|Other|BC on Snow":
+            out.get(f"{erf}|Black Carbon on Snow"),
+    }
+    for name, value in rcmip_aggregations.items():
+        if value is not None:
+            out[name] = value
+
+    # New sub-totals grouped by chemistry family.
+    if hfcs:
+        maybe(f"{erf}|Anthropogenic|F-Gases|HFC", sum_over(hfcs))
+    if pfcs:
+        maybe(f"{erf}|Anthropogenic|F-Gases|PFC", sum_over(pfcs))
+    if cfcs:
+        maybe(f"{erf}|Anthropogenic|Montreal Gases|CFC", sum_over(cfcs))
+    if hcfcs:
+        maybe(f"{erf}|Anthropogenic|Montreal Gases|HCFC", sum_over(hcfcs))
+    if halons:
+        maybe(f"{erf}|Anthropogenic|Montreal Gases|Halon", sum_over(halons))
+
+    # Per-species CO2/CH4/N2O aliases used by RCMIP under the
+    # |Anthropogenic| umbrella.
+    for spec_leaf, spec in (
+        ("CO2", "CO2"), ("CH4", "CH4"), ("N2O", "N2O"),
+    ):
+        if spec in species_in_run:
+            v = (
+                forcing_da.sel(specie=spec)
+                .isel(scenario=sc_idx, config=member_offset)
+                .values
+            )
+            maybe(f"Effective Radiative Forcing|Anthropogenic|{spec_leaf}", v)
 
     return out
 
