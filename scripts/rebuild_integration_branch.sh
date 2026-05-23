@@ -33,7 +33,6 @@ BRANCHES=(
   modernisation/netcdf-writer
   modernisation/fair2-adapter
   modernisation/ciceroscmpy2-adapter
-  modernisation/fair2-conc-driven
 )
 
 INTEGRATION_BRANCH="modernisation/integration"
