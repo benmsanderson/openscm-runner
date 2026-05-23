@@ -402,6 +402,10 @@ def test_extract_heat_content_converts_to_zj(fake_fair):
 
 
 def test_extract_heat_uptake(fake_fair):
+    from openscm_runner.adapters.fair2_adapter._output_extractor import (
+        _TOA_W_PER_M2_TO_ZJ_PER_YR,
+    )
+
     res = extract_outputs(
         fake_fair,
         scenarios=["ssp245"],
@@ -410,8 +414,17 @@ def test_extract_heat_uptake(fake_fair):
         run_id_offset=0,
         properties_df=fake_fair.properties_df,
     )
-    np.testing.assert_allclose(res.values, 0.7)
-    assert set(res["unit"]) == {"W/m^2"}
+    # Heat Uptake is reported in ZJ/yr (RCMIP convention) -
+    # toa_imbalance W/m^2 * Earth surface * seconds/yr / 1e21.
+    # Net Energy Imbalance keeps the raw W/m^2.
+    uptake = res.filter(variable="Heat Uptake")
+    nei = res.filter(variable="Net Energy Imbalance")
+    np.testing.assert_allclose(
+        uptake.values, 0.7 * _TOA_W_PER_M2_TO_ZJ_PER_YR
+    )
+    assert uptake.get_unique_meta("unit", True) == "ZJ/yr"
+    np.testing.assert_allclose(nei.values, 0.7)
+    assert nei.get_unique_meta("unit", True) == "W/m^2"
 
 
 def test_extract_airborne_fraction_sums_co2_components(fake_fair):
@@ -482,3 +495,39 @@ def test_concentration_unit_defaults_to_ppt():
     assert _concentration_unit("N2O") == "ppb"
     assert _concentration_unit("CFC-11") == "ppt"
     assert _concentration_unit("HFC-23") == "ppt"
+
+
+def test_extract_resolves_hierarchical_rcmip_paths(fake_fair):
+    """
+    RCMIP uses hierarchical variable paths like
+    ``Atmospheric Concentrations|F-Gases|HFC|HFC23``. The extractor
+    must strip to the leaf segment (``HFC23``) and look it up in
+    ``OUTPUT_LEAF_TO_FAIR2_SPECIES`` the same way it would for the
+    flat ``Atmospheric Concentrations|HFC23`` form.
+    """
+    res = extract_outputs(
+        fake_fair,
+        scenarios=["ssp245"],
+        members=_two_members(),
+        output_variables=(
+            "Atmospheric Concentrations|F-Gases|HFC|HFC23",
+            "Effective Radiative Forcing|Anthropogenic|F-Gases|HFC|HFC23",
+            "Atmospheric Concentrations|Montreal Gases|CFC|CFC11",
+        ),
+        run_id_offset=0,
+        properties_df=fake_fair.properties_df,
+    )
+    assert set(res["variable"]) == {
+        "Atmospheric Concentrations|F-Gases|HFC|HFC23",
+        "Effective Radiative Forcing|Anthropogenic|F-Gases|HFC|HFC23",
+        "Atmospheric Concentrations|Montreal Gases|CFC|CFC11",
+    }
+    # Resolves to the same species data as the flat-form lookup
+    deep = res.filter(
+        variable="Atmospheric Concentrations|F-Gases|HFC|HFC23"
+    ).values[0, 0]
+    assert deep == 28.0  # HFC-23 conc level from fixture
+    erf = res.filter(
+        variable="Effective Radiative Forcing|Anthropogenic|F-Gases|HFC|HFC23"
+    ).values[0, 0]
+    assert erf == 0.01  # HFC-23 ERF level from fixture

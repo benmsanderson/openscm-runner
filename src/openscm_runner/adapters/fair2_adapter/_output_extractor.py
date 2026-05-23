@@ -61,6 +61,13 @@ GMST_TO_GSAT_SCALE = 1.0 / 1.04
 # ocean_heat_content_change in J; openscm-runner uses ZJ.
 J_TO_ZJ = 1e-21
 
+# Earth surface area (m^2) and seconds in a year, for converting
+# `toa_imbalance` (W/m^2) to Heat Uptake (ZJ/yr).
+_EARTH_SURFACE_AREA = 5.101e14
+_SECONDS_PER_YEAR = 365.25 * 24 * 3600
+# W/m^2 -> ZJ/yr scaling factor: W * (m^2) * (s/yr) / (J/ZJ)
+_TOA_W_PER_M2_TO_ZJ_PER_YR = _EARTH_SURFACE_AREA * _SECONDS_PER_YEAR * J_TO_ZJ
+
 
 # Output leaf names (the part after "Atmospheric Concentrations|" or
 # "Effective Radiative Forcing|") -> FaIR 2.x species names.
@@ -324,17 +331,49 @@ def extract_outputs(  # noqa: PLR0913, PLR0912, PLR0915
                         rows, scenario, variable, "ZJ", run_id, values * J_TO_ZJ
                     )
                     continue
-                if variable in (
-                    "Heat Uptake",
-                    "Heat Uptake|Ocean",
-                    "Net Energy Imbalance",
-                ):
+                if variable in ("Heat Uptake", "Heat Uptake|Ocean"):
+                    # RCMIP wants ZJ/yr. FaIR's toa_imbalance is the
+                    # planetary net flux in W/m^2; convert to global
+                    # ZJ/yr via Earth surface area * seconds in a year.
+                    # `Heat Uptake|Ocean` approximated by total Heat
+                    # Uptake: FaIR's 2-layer ocean is the dominant
+                    # heat sink and atmosphere / land / ice splits
+                    # aren't modelled separately.
+                    values = (
+                        f.toa_imbalance.isel(scenario=sc_idx, config=member_offset)
+                        .to_pandas()
+                        .reindex(timebounds)
+                    )
+                    _row(
+                        rows, scenario, variable, "ZJ/yr", run_id,
+                        values * _TOA_W_PER_M2_TO_ZJ_PER_YR,
+                    )
+                    continue
+                if variable == "Net Energy Imbalance":
+                    # Same source as Heat Uptake but reported in the
+                    # native W/m^2 the underlying quantity has.
                     values = (
                         f.toa_imbalance.isel(scenario=sc_idx, config=member_offset)
                         .to_pandas()
                         .reindex(timebounds)
                     )
                     _row(rows, scenario, variable, "W/m^2", run_id, values)
+                    continue
+                if variable == "Surface Ocean Temperature Change":
+                    # Mid-ocean layer (layer=1) in FaIR 2.x's stochastic
+                    # energy-balance model; serves as the deeper-ocean
+                    # temperature anomaly. FaIR's layer=0 is the
+                    # surface (GSAT proxy), layer=2 is the deepest box.
+                    if f.temperature.sizes.get("layer", 0) < 2:
+                        continue
+                    values = (
+                        f.temperature.isel(
+                            scenario=sc_idx, config=member_offset, layer=1
+                        )
+                        .to_pandas()
+                        .reindex(timebounds)
+                    )
+                    _row(rows, scenario, variable, "K", run_id, values)
                     continue
                 if variable == "Airborne Fraction":
                     co2_components = [
@@ -368,16 +407,52 @@ def extract_outputs(  # noqa: PLR0913, PLR0912, PLR0915
                     _row(rows, scenario, variable, unit, run_id, series)
                     continue
 
-                # Per-species patterns
+                # Per-species patterns. RCMIP uses both flat
+                # `Emissions|HFC125` and hierarchical
+                # `Emissions|F-Gases|HFC|HFC125` forms for the same
+                # species, so we always take the LAST `|`-separated
+                # segment as the leaf and look it up. Paths whose
+                # leaf is not a species (e.g.
+                # `Effective Radiative Forcing|Anthropogenic|F-Gases|HFC`,
+                # `Atmospheric Concentrations|F-Gases`) fall through
+                # to aggregation lookup below.
+                # Per-species derived quantities (Carbon Cycle / Methane
+                # / N2O lifetimes etc). Cumulative Emissions and Net
+                # Flux to Atmosphere derive directly from FaIR's
+                # cumulative_emissions / airborne_emissions arrays.
+                # Atmospheric Lifetime is alpha_lifetime[specie] (a
+                # dimensionless scaling factor times the baseline
+                # lifetime stored in species_configs).
                 handled = False
                 for prefix, extractor in (
                     ("Atmospheric Concentrations|", _atmos_conc),
                     ("Effective Radiative Forcing|", _erf_per_species),
                     ("Emissions|", _emissions_per_species),
+                    ("Cumulative Emissions|", _cumulative_emissions_per_species),
+                    ("Atmospheric Lifetime|", _atmospheric_lifetime_per_species),
+                    ("Net Flux to Atmosphere|", _net_flux_per_species),
+                    ("Airborne Emissions|", _airborne_emissions_per_species),
                 ):
                     if variable.startswith(prefix):
+                        # Use the last segment after `|` as the species
+                        # leaf; falls back to the full subpath if the
+                        # variable name has no further `|` separator
+                        # beyond the prefix (e.g. `Emissions|CO2`).
+                        rest = variable[len(prefix) :]
+                        leaf = rest.split("|")[-1] if "|" in rest else rest
+                        # Special case: `Emissions|CO2|MAGICC Fossil and
+                        # Industrial` is two segments where the leaf
+                        # alone ("MAGICC Fossil and Industrial") isn't
+                        # what _emissions_per_species keys on; preserve
+                        # the existing `CO2|MAGICC …` form when the
+                        # full rest already matches a known sub-key.
+                        if extractor is _emissions_per_species and rest in (
+                            "CO2|MAGICC Fossil and Industrial",
+                            "CO2|MAGICC AFOLU",
+                        ):
+                            leaf = rest
                         result = extractor(
-                            f, variable[len(prefix) :], sc_idx, member_offset
+                            f, leaf, sc_idx, member_offset
                         )
                         if result is not None:
                             values, unit = result
@@ -489,6 +564,135 @@ def _emissions_per_species(  # noqa: PLR0911
         return None
     unit = desired_emissions_units.get(species_name, "unknown")
     return values, unit
+
+
+def _cumulative_emissions_per_species(f, leaf, sc_idx, member_offset):
+    """Read cumulative emissions for ``leaf``; unit is Gt-equivalent."""
+    from fair.structure.units import desired_emissions_units
+
+    def _cum(spec):
+        return _read_specie_array(
+            f, "cumulative_emissions", spec, sc_idx, member_offset
+        )
+
+    if leaf == "CO2":
+        ffi = _cum("CO2 FFI")
+        afolu = _cum("CO2 AFOLU")
+        if ffi is None or afolu is None:
+            return None
+        unit = desired_emissions_units.get("CO2 FFI", "Gt C/yr").replace("/yr", "")
+        return ffi + afolu, unit
+    species_name = OUTPUT_LEAF_TO_FAIR2_SPECIES.get(leaf)
+    if species_name is None:
+        return None
+    values = _cum(species_name)
+    if values is None:
+        return None
+    unit = desired_emissions_units.get(species_name, "unknown/yr").replace(
+        "/yr", ""
+    )
+    return values, unit
+
+
+def _atmospheric_lifetime_per_species(f, leaf, sc_idx, member_offset):
+    """
+    Effective atmospheric lifetime for a species.
+
+    FaIR stores ``alpha_lifetime`` (dimensionless scaling factor on
+    the baseline lifetime) per (timebound, scenario, config, specie).
+    Multiplying by the species' baseline ``unperturbed_lifetime``
+    from species_configs gives the effective lifetime in years.
+    """
+    species_name = OUTPUT_LEAF_TO_FAIR2_SPECIES.get(leaf)
+    if species_name is None or species_name not in f.alpha_lifetime["specie"].values:
+        return None
+    alpha = (
+        f.alpha_lifetime.sel(specie=species_name)
+        .isel(scenario=sc_idx, config=member_offset)
+        .values
+    )
+    # Baseline lifetime is per-config in species_configs (xarray:
+    # `unperturbed_lifetime` dims (specie, config, gasbox)). For
+    # single-lifetime species (CH4, N2O), gasbox=0 holds the value.
+    try:
+        baseline = float(
+            f.species_configs["unperturbed_lifetime"]
+            .sel(specie=species_name)
+            .isel(config=member_offset, gasbox=0)
+            .values
+        )
+    except Exception:  # pylint: disable=broad-except
+        return None
+    return alpha * baseline, "yr"
+
+
+def _net_flux_per_species(f, leaf, sc_idx, member_offset):
+    """
+    Net flux to atmosphere (year-over-year cumulative emissions delta).
+
+    For CO2 this is the net source/sink summed over FFI + AFOLU; for
+    other GHGs it's the per-species annual flux. Unit matches the
+    species' annual emissions unit (kt / Mt / Gt per yr).
+    """
+    import numpy as np
+    from fair.structure.units import desired_emissions_units
+
+    def _flux(spec):
+        cum = _read_specie_array(
+            f, "cumulative_emissions", spec, sc_idx, member_offset
+        )
+        if cum is None:
+            return None
+        # Net flux on each timebound = diff of cumulative (year-over-year).
+        return np.concatenate([[np.nan], np.diff(cum)])
+
+    if leaf == "CO2":
+        ffi = _flux("CO2 FFI")
+        afolu = _flux("CO2 AFOLU")
+        if ffi is None or afolu is None:
+            return None
+        unit = desired_emissions_units.get("CO2 FFI", "Gt C/yr")
+        return ffi + afolu, unit
+    species_name = OUTPUT_LEAF_TO_FAIR2_SPECIES.get(leaf)
+    if species_name is None:
+        return None
+    values = _flux(species_name)
+    if values is None:
+        return None
+    unit = desired_emissions_units.get(species_name, "unknown/yr")
+    return values, unit
+
+
+def _airborne_emissions_per_species(f, leaf, sc_idx, member_offset):
+    """Read FaIR's airborne_emissions for ``leaf`` (cumulative)."""
+    from fair.structure.units import desired_emissions_units
+
+    species_name = OUTPUT_LEAF_TO_FAIR2_SPECIES.get(leaf)
+    if species_name is None:
+        return None
+    values = _read_specie_array(
+        f, "airborne_emissions", species_name, sc_idx, member_offset
+    )
+    if values is None:
+        return None
+    unit = desired_emissions_units.get(species_name, "unknown/yr").replace(
+        "/yr", ""
+    )
+    return values, unit
+
+
+def _read_specie_array(
+    f, array_name: str, spec: str, sc_idx: int, member_offset: int
+):
+    """Index a per-species (timebound, scenario, config) array on FAIR."""
+    array = getattr(f, array_name)
+    if spec not in array["specie"].values:
+        return None
+    return (
+        array.sel(specie=spec)
+        .isel(scenario=sc_idx, config=member_offset)
+        .values
+    )
 
 
 def _build_scmrun(rows, timebounds) -> ScmRun:
