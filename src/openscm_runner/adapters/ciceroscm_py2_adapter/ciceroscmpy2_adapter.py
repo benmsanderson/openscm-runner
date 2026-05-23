@@ -79,9 +79,17 @@ fallback for back-compat.
   ``CICEROSCM_WORKER_NUMBER`` as the override env var.
 - ``nystart`` / ``nyend`` / ``emstart`` (optional): time bounds.
   Defaults: ``nystart=1750``,
-  ``nyend=max(scenario_year)``. ``emstart`` defaults to 1850 in
-  bundle mode (matching Marit's setup) and to the first user-
-  scenario year in splice mode.
+  ``nyend=max(scenario_year)``. ``emstart`` is auto-derived in
+  bundle mode (1850 for ``esm-allghg-*``; ``nyend`` for other
+  emissions-driven and all concentration-driven runs, matching
+  Marit's ``run_full_rcmip_protocol.py``); splice mode keeps the
+  first-user-scenario-year default.
+- ``cicero_conc_run`` (bundle mode, optional): force
+  concentration-driven (``True``) or emissions-driven (``False``).
+  Default is auto-detect from scenario name: ``esm-*`` and
+  ``methanemip-*`` are emissions-driven; everything else (ssp*,
+  scen7-*, 1pctCO2*, abrupt*, hist-*, piControl) is
+  concentration-driven, matching Marit's protocol runner.
 - ``sunvolc`` (optional, default ``1``).
 - Optional pass-through forcing-file overrides: ``rf_sun_file``,
   ``rf_volc_n_file``, ``rf_volc_s_file``, ``rf_volc_file``,
@@ -577,7 +585,22 @@ def _build_hybrid_emissions_data(  # noqa: PLR0913
     return df
 
 
-def _build_scendata_list_bundle(
+def _auto_conc_run(scenario_name: str) -> bool:
+    """
+    Auto-detect whether ``scenario_name`` should run concentration-driven.
+
+    Mirrors ``run_full_rcmip_protocol.py``: scenarios starting with
+    ``esm-`` or ``methanemip`` are emissions-driven; everything else
+    (ssp*, scen7-*, 1pctCO2*, abrupt*, hist-*, historical*, piControl)
+    is concentration-driven. This is the same rule the CICERO native
+    runner applies when assembling scendata for the RCMIP3 protocol.
+    """
+    s = scenario_name.lower()
+    return not (s.startswith("esm-") or s.startswith("esm_") or
+                s.startswith("methanemip"))
+
+
+def _build_scendata_list_bundle(  # noqa: PLR0912, PLR0915
     scenarios, cfg: dict[str, Any]
 ) -> list[dict[str, Any]]:
     """
@@ -618,12 +641,6 @@ def _build_scendata_list_bundle(
     else:
         nyend = int(cfg.get("nyend", 2100))
         scenario_names = ["historical"]
-    # SCIENTIFIC CHOICE: emstart=1850 in bundle mode (matches the
-    # AR6 / RCMIP3 convention Marit's calibration was built around;
-    # the 1750-1849 historical is concentration-driven for parity
-    # with the constraint targets). Splice mode keeps the legacy
-    # "first user-scenario year" default for back-compat.
-    emstart = int(cfg.get("emstart", 1850))
     sunvolc = int(cfg.get("sunvolc", 1))
 
     # Preload natural emissions DataFrames (avoids the read-time
@@ -647,6 +664,39 @@ def _build_scendata_list_bundle(
         #      scenarios with no bundle file
         #   4. `historical_em` as a last-resort fallback (constant
         #      after the historical end year)
+        # Resolve conc_run + emstart per scenario, following Marit's
+        # convention (run_full_rcmip_protocol.py):
+        # - `esm-allghg-*` and other emissions-driven runs: conc_run
+        #   False, emstart=1850 (so emissions drive 1850 onward).
+        # - `esm-*` / `methanemip-*` non-allghg: conc_run False,
+        #   emstart=nyend (effectively suppresses the historical
+        #   emissions period; bundle scenario file is the source of
+        #   truth for emissions over the whole window).
+        # - Everything else (ssp*, scen7-*, 1pctCO2*, abrupt*, hist-*,
+        #   piControl): conc_run True, emstart=nyend (concentration
+        #   trajectory drives the whole run).
+        # Cfg can override both via `cicero_conc_run` and `emstart`.
+        explicit_conc_run = cfg.get("cicero_conc_run")
+        if explicit_conc_run is None:
+            conc_run = _auto_conc_run(scenario_name)
+        else:
+            conc_run = bool(explicit_conc_run)
+
+        if "emstart" in cfg:
+            scen_emstart = int(cfg["emstart"])
+        elif conc_run:
+            scen_emstart = nyend  # conc-driven: emissions never take over
+        elif scenario_name.lower().startswith(
+            ("esm-allghg", "esm_allghg")
+        ):
+            scen_emstart = 1850   # full historical emissions-driven
+        else:
+            # esm-* / methanemip-* (non-allghg): bundle's scenario file
+            # carries the full 1750-end trajectory, but Marit's runner
+            # sets emstart=yend so the historical pre-period is
+            # consumed via concentrations. Same convention here.
+            scen_emstart = nyend
+
         em_override = cfg.get("emissions_file")
         bundle_scen_em = os.path.join(
             bundle_dir, f"{scenario_name}_em_{gases_ep}"
@@ -670,7 +720,7 @@ def _build_scendata_list_bundle(
                 gases_ep=gases_ep,
                 nystart=nystart,
                 nyend=nyend,
-                emstart=emstart,
+                emstart=scen_emstart,
             )
             LOGGER.info(
                 "CICEROSCMPY2 bundle mode: scenario %r has no bundle "
@@ -718,9 +768,9 @@ def _build_scendata_list_bundle(
         scendata: dict[str, Any] = {
             "nystart": nystart,
             "nyend": nyend,
-            "emstart": emstart,
+            "emstart": scen_emstart,
             "sunvolc": sunvolc,
-            "conc_run": False,
+            "conc_run": conc_run,
             "idtm": 24,
             "scenname": scenario_name,
             "gaspam_file": gaspam_file,
@@ -740,11 +790,12 @@ def _build_scendata_list_bundle(
             scendata["emissions_file"] = em_path
         LOGGER.debug(
             "CICEROSCMPY2 bundle scendata for scenario=%s years=%d-%d "
-            "(emstart=%d) em=%s conc=%s",
+            "(emstart=%d, conc_run=%s) em=%s conc=%s",
             scenario_name,
             nystart,
             nyend,
-            emstart,
+            scen_emstart,
+            conc_run,
             "<hybrid-DataFrame>" if em_path is None else os.path.basename(em_path),
             os.path.basename(conc_path),
         )
