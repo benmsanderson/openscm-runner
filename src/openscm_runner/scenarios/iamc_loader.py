@@ -65,6 +65,20 @@ _SPECIES_RENAMES = {
     "NMVOC": "VOC",
 }
 
+# Unit-string fixups applied to the ``unit`` column in lockstep with the
+# species renames above. SCI in particular reports HFC4310mee as
+# ``kt HFC43-10/yr``: the dash is not a valid pint symbol character so
+# openscm-units rejects the string outright, and the downstream adapter
+# converter then silently falls back to bundle defaults for that species.
+# Rewriting to ``kt HFC4310mee/yr`` (the RCMIP convention) lets
+# openscm-units parse the source unit; the downstream conversion to
+# whatever the adapter bundle prefers (e.g. ``kt HFC4310/yr``) is then
+# handled by openscm-units' molecule equivalence table.
+#
+# Order matters: HFC43-10 must be handled before HFC4310 (otherwise the
+# bare-43-10 string never matches), and HFC4310 must only be rewritten
+# when ``mee`` does not already follow.
+
 # CO2 sector splits. Source-format sector names on the left, canonical
 # MAGICC names on the right. ``AFOLU [NGHGI]`` is intentionally absent
 # (see module docstring).
@@ -150,7 +164,7 @@ def load_iamc(
     """
     path = Path(path)
     df = _read_iamc(path, sheet=sheet)
-    df = _harmonise_variables(df)
+    df = _harmonise(df)
     df = _filter(df, scenarios=scenarios, region=region, variables=variables)
     if df.empty:
         raise ValueError(
@@ -184,10 +198,25 @@ def _read_iamc(path: Path, *, sheet: str) -> pd.DataFrame:
     return df
 
 
-def _harmonise_variables(df: pd.DataFrame) -> pd.DataFrame:
+def _harmonise(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     out["variable"] = out["variable"].map(_canonicalise_variable)
+    out["unit"] = out["unit"].map(_canonicalise_unit)
     return out
+
+
+def _canonicalise_unit(u: str) -> str:
+    if not isinstance(u, str):
+        return u
+    if "HFC43-10" in u:
+        u = u.replace("HFC43-10", "HFC4310mee")
+    elif "HFC4310" in u and "HFC4310mee" not in u:
+        u = u.replace("HFC4310", "HFC4310mee")
+    if "SOx" in u:
+        u = u.replace("SOx", "Sulfur")
+    if "NMVOC" in u:
+        u = u.replace("NMVOC", "VOC")
+    return u
 
 
 def _canonicalise_variable(name: str) -> str:
