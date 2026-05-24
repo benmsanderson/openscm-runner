@@ -14,5 +14,18 @@ from openscm_runner.scenarios.iamc_loader import (
     CANONICAL_VARIABLES,
     load_iamc,
 )
+from openscm_runner.scenarios.rcmip3 import (
+    CONSTRAINT_TARGETS,
+    available_scenarios,
+    constraint_targets_dataframe,
+    load_rcmip3_emissions,
+)
 
-__all__ = ["CANONICAL_VARIABLES", "load_iamc"]
+__all__ = [
+    "CANONICAL_VARIABLES",
+    "CONSTRAINT_TARGETS",
+    "available_scenarios",
+    "constraint_targets_dataframe",
+    "load_iamc",
+    "load_rcmip3_emissions",
+]
