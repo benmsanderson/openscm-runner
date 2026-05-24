@@ -34,11 +34,34 @@ def test_parse_args_defaults():
     args = runner._parse_args([])
     assert args.models == ["fair2", "ciceroscmpy2"]
     assert args.members == 10
+    assert args.mode == "both"
     assert args.scenarios is None
     assert args.scenario_set is None
     # Default output and cache dirs live under the repo root.
     assert args.output_dir.name == "rcmip3"
     assert args.cache_dir.name == "rcmip3"
+
+
+def test_parse_args_mode_choices():
+    for mode in ("emissions", "concentrations", "both"):
+        assert runner._parse_args(["--mode", mode]).mode == mode
+    with pytest.raises(SystemExit):
+        runner._parse_args(["--mode", "neither"])
+
+
+def test_scenarios_for_mode_keeps_all_in_emissions_mode():
+    inputs = ("ssp245", "esm-flat10", "esm-flat10-zec", "scen7-VL")
+    assert runner._scenarios_for_mode(inputs, runner.MODE_EMISSIONS) == inputs
+
+
+def test_scenarios_for_mode_drops_esm_flat_in_concentrations_mode():
+    inputs = ("ssp245", "esm-flat10", "esm-flat10-zec", "scen7-VL", "historical")
+    out = runner._scenarios_for_mode(inputs, runner.MODE_CONCENTRATIONS)
+    assert "esm-flat10" not in out
+    assert "esm-flat10-zec" not in out
+    assert "ssp245" in out
+    assert "scen7-VL" in out
+    assert "historical" in out
 
 
 def test_parse_args_explicit_overrides():

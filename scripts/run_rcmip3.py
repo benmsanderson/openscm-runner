@@ -1,13 +1,23 @@
 """
 RCMIP3 protocol runner: dispatch one or more SCMs across the RCMIP3
-emissions-driven experiment set and stream per-(model, scenario) output
-to a netCDF tree on disk.
+experiment set in emissions-driven and/or concentration-driven mode,
+streaming per-(mode, model, scenario) output to a netCDF tree on disk.
 
 Replaces the per-model demos ``scripts/run_rcmip_fair2.py`` and
 ``scripts/run_rcmip_ciceroscm_py2.py``. Scenarios are resolved through
 :func:`openscm_runner.scenarios.load_rcmip3_emissions` so the same CLI
 covers the CMIP6 SSPs, the CMIP7 ScenarioMIP ``scen7-*`` set, and the
 ``esm-flat*`` idealised family.
+
+Modes
+-----
+Both FaIRv2 and CICEROSCMPY2 can run either emissions-driven or
+concentration-driven on every SSP / scen7 / historical scenario.
+``--mode both`` (default) dispatches each pair through both modes so
+the notebook can compare carbon-cycle behaviour against prescribed
+concentrations. The idealised ``esm-flat*`` family is emissions-driven
+by construction and is silently skipped from any concentration-driven
+sub-run.
 
 Example
 -------
@@ -20,7 +30,7 @@ Example
     export FAIR2_CALIBRATION_PATH=$PWD/configurations/fair-calibrate-v1.6.0
     export CICEROSCMPY2_BUNDLE_DIR=$PWD/configurations/ciceroscm
 
-    # 10-member sweep across SSPs + scen7 + flat-*:
+    # 10-member sweep across SSPs + scen7 + flat-*, both modes:
     scripts/run_rcmip3.py --members 10 --scenario-set all
 
     # Smaller / faster iteration:
@@ -29,20 +39,27 @@ Example
 Output layout
 -------------
 ``--output-dir`` (default ``out/rcmip3/``) ends up containing one
-file per (model, scenario) pair::
+file per (mode, model, scenario) tuple::
 
     out/rcmip3/
-        FaIRv2/
-            ssp119.nc
-            ssp245.nc
-            …
-        CICERO-SCM-PY2/
-            ssp119.nc
-            …
+        emissions/
+            FaIRv2/
+                ssp119.nc
+                ssp245.nc
+                …
+            CICERO-SCM-PY2/
+                ssp119.nc
+                …
+        concentrations/
+            FaIRv2/
+                ssp119.nc
+                …
+            CICERO-SCM-PY2/
+                ssp119.nc
+                …
 
 Read back with::
 
-    from openscm_runner.output import RunResult
     from pathlib import Path
     import scmdata
     chunks = [scmdata.ScmRun.from_nc(p) for p in Path("out/rcmip3").rglob("*.nc")]
@@ -124,31 +141,61 @@ _SCENARIO_SETS["all"] = (
 # Adapter cfg builders
 # ---------------------------------------------------------------------------
 
+# Mode labels used both in the CLI surface and as the top-level output
+# subdirectory. Keep stable: the notebook reads these by name.
+MODE_EMISSIONS = "emissions"
+MODE_CONCENTRATIONS = "concentrations"
+VALID_MODES = (MODE_EMISSIONS, MODE_CONCENTRATIONS)
 
-def _build_cfg_fair2(members: int) -> list[dict[str, Any]]:
+
+def _cicero_bundle_dir() -> Path:
+    """Resolve the CICERO RCMIP-aligned bundle directory used by both adapters.
+
+    FaIRv2 conc-driven mode reads ``{scen}_conc_*`` files from the same
+    Marit RCMIP-aligned bundle that CICEROSCMPY2's bundle mode uses, so
+    one env var (``CICEROSCMPY2_BUNDLE_DIR``) drives both.
+    """
+    return Path(
+        os.environ.get(
+            "CICEROSCMPY2_BUNDLE_DIR",
+            Path(__file__).parent.parent / "configurations" / "ciceroscm",
+        )
+    )
+
+
+def _build_cfg_fair2(members: int, mode: str) -> list[dict[str, Any]]:
     bundle = os.environ.get("FAIR2_CALIBRATION_PATH")
     if not bundle:
         raise SystemExit(
             "FaIRv2 selected but FAIR2_CALIBRATION_PATH is not set. "
             "See scripts/download_fair2_calibration.py."
         )
-    return [
-        {
-            "native_calibration": bundle,
-            "member_indices": range(members),
-            "emissions_bundle": bundle,
-        }
-    ]
+    cfg: dict[str, Any] = {
+        "native_calibration": bundle,
+        "member_indices": range(members),
+        "emissions_bundle": bundle,
+    }
+    if mode == MODE_CONCENTRATIONS:
+        rcmip_bundle = _cicero_bundle_dir() / "rcmip-march2026"
+        if not rcmip_bundle.is_dir():
+            raise SystemExit(
+                "FaIRv2 conc-driven mode requires the CICERO RCMIP bundle at "
+                f"{rcmip_bundle}. Install it under $CICEROSCMPY2_BUNDLE_DIR/"
+                "rcmip-march2026/ or run with --mode emissions only."
+            )
+        cfg["fair2_conc_driven"] = True
+        cfg["fair2_conc_bundle_dir"] = str(rcmip_bundle)
+    return [cfg]
 
 
-def _build_cfg_ciceroscmpy2(members: int) -> list[dict[str, Any]]:
-    """Bundle mode if rcmip-march2026/ is present, otherwise splice fallback."""
-    bundle_dir = Path(
-        os.environ.get(
-            "CICEROSCMPY2_BUNDLE_DIR",
-            Path(__file__).parent.parent / "configurations" / "ciceroscm",
-        )
-    )
+def _build_cfg_ciceroscmpy2(members: int, mode: str) -> list[dict[str, Any]]:
+    """Bundle mode if rcmip-march2026/ is present, otherwise splice fallback.
+
+    In concentration-driven mode the bundle is mandatory (splice mode
+    has no clean conc-driven story); the adapter raises if the bundle
+    is missing.
+    """
+    bundle_dir = _cicero_bundle_dir()
     distribution_json = bundle_dir / "draw_samples_500.json"
     if not distribution_json.exists():
         raise SystemExit(
@@ -165,35 +212,73 @@ def _build_cfg_ciceroscmpy2(members: int) -> list[dict[str, Any]]:
     rcmip_aligned = bundle_dir / "rcmip-march2026"
     if rcmip_aligned.is_dir():
         cfg["cicero_bundle_dir"] = str(rcmip_aligned)
-        return [cfg]
-
-    # Splice fallback. The adapter itself warns about the present-day
-    # warm bias when this path runs; we still echo the warning here so
-    # users running with --models ciceroscmpy2 see it in CLI output.
-    LOGGER.warning(
-        "CICERO-SCM bundle dir %s not found; falling back to splice mode "
-        "(present-day ~0.3-0.5 K warm bias — install the Marit "
-        "RCMIP-aligned bundle for bit-exact reference reproduction).",
-        rcmip_aligned,
-    )
-    gaspam = bundle_dir / "gases_vupdate_2022_AR6.txt"
-    concentrations = bundle_dir / "ssp245_conc_RCMIP.txt"
-    missing = [p for p in (gaspam, concentrations) if not p.exists()]
-    if missing:
+    elif mode == MODE_CONCENTRATIONS:
         raise SystemExit(
-            "CICERO-SCM-PY2 splice-mode fallback also lacks files: "
-            + ", ".join(str(p) for p in missing)
+            "CICERO-SCM-PY2 conc-driven mode requires the RCMIP bundle at "
+            f"{rcmip_aligned}; splice fallback has no clean conc-driven path."
         )
-    cfg["gaspam_file"] = str(gaspam)
-    cfg["concentrations_file"] = str(concentrations)
+    else:
+        # Emissions-driven splice fallback. Adapter warns at runtime
+        # about the present-day warm bias; echo it here too.
+        LOGGER.warning(
+            "CICERO-SCM bundle dir %s not found; falling back to splice "
+            "mode (present-day ~0.3-0.5 K warm bias — install the "
+            "Marit RCMIP-aligned bundle for bit-exact reproduction).",
+            rcmip_aligned,
+        )
+        gaspam = bundle_dir / "gases_vupdate_2022_AR6.txt"
+        concentrations = bundle_dir / "ssp245_conc_RCMIP.txt"
+        missing = [p for p in (gaspam, concentrations) if not p.exists()]
+        if missing:
+            raise SystemExit(
+                "CICERO-SCM-PY2 splice-mode fallback also lacks files: "
+                + ", ".join(str(p) for p in missing)
+            )
+        cfg["gaspam_file"] = str(gaspam)
+        cfg["concentrations_file"] = str(concentrations)
+
+    if mode == MODE_CONCENTRATIONS:
+        cfg["cicero_conc_run"] = True
+    elif mode == MODE_EMISSIONS:
+        # Override the adapter's name-based auto-detection so non-`esm-`
+        # scenarios (ssp245, scen7-VL, …) still run emissions-driven
+        # when the user explicitly asks for emissions mode.
+        cfg["cicero_conc_run"] = False
     return [cfg]
 
 
-# Map CLI model alias -> (canonical model name, cfg builder).
+# Map CLI model alias -> (canonical model name, cfg builder taking (members, mode)).
 _MODEL_DISPATCH: dict[str, tuple[str, Any]] = {
     "fair2": ("FaIRv2", _build_cfg_fair2),
     "ciceroscmpy2": ("CICERO-SCM-PY2", _build_cfg_ciceroscmpy2),
 }
+
+
+def _scenarios_for_mode(scenarios: Sequence[str], mode: str) -> tuple[str, ...]:
+    """Drop scenarios that are conceptually incompatible with ``mode``.
+
+    The ``esm-flat*`` idealised family is emissions-driven by
+    construction (the protocol prescribes constant CO2 emissions and
+    reads out concentrations as a diagnostic); CD mode would require
+    bundle concentration files derived from the same model run, which
+    defeats the purpose of the experiment. Skip them with a warning.
+    """
+    if mode == MODE_EMISSIONS:
+        return tuple(scenarios)
+    filtered = []
+    dropped = []
+    for s in scenarios:
+        if s.startswith("esm-flat"):
+            dropped.append(s)
+        else:
+            filtered.append(s)
+    if dropped:
+        LOGGER.warning(
+            "Skipping %d esm-flat* scenario(s) from --mode concentrations "
+            "(they are emissions-driven by construction): %s",
+            len(dropped), ", ".join(dropped),
+        )
+    return tuple(filtered)
 
 
 # ---------------------------------------------------------------------------
@@ -203,18 +288,19 @@ _MODEL_DISPATCH: dict[str, tuple[str, Any]] = {
 
 def _run_one_model(
     model_alias: str,
+    mode: str,
     scenarios: scmdata.ScmRun,
     members: int,
     writer: NetCDFChunkWriter,
 ) -> None:
-    """Run one adapter across all loaded scenarios; stream output to disk."""
+    """Run one (adapter, mode) pair across the loaded scenarios; stream to disk."""
     canonical, build_cfgs = _MODEL_DISPATCH[model_alias]
-    cfgs = build_cfgs(members)
+    cfgs = build_cfgs(members, mode)
 
     scen_names = sorted(scenarios["scenario"].unique())
     LOGGER.info(
-        "%s: dispatching %d scenarios x %d members",
-        canonical, len(scen_names), members,
+        "%s [%s]: dispatching %d scenarios x %d members",
+        canonical, mode, len(scen_names), members,
     )
 
     t0 = time.time()
@@ -227,21 +313,22 @@ def _run_one_model(
     )
     elapsed = time.time() - t0
     LOGGER.info(
-        "%s: finished %d chunks in %.1fs (%.2fs / scenario)",
-        canonical, result.n_chunks, elapsed,
+        "%s [%s]: finished %d chunks in %.1fs (%.2fs / scenario)",
+        canonical, mode, result.n_chunks, elapsed,
         elapsed / max(len(scen_names), 1),
     )
 
-    _print_summary(canonical, result, scen_names)
+    _print_summary(canonical, mode, result, scen_names)
 
 
 def _print_summary(
     canonical_model: str,
+    mode: str,
     result,
     scenario_names: Sequence[str],
 ) -> None:
     """Print a per-scenario 2100 quantile summary across members."""
-    print(f"\n=== {canonical_model}: 2100 summary "
+    print(f"\n=== {canonical_model} [{mode}]: 2100 summary "
           "(median / 5-95% across members) ===")
     for scenario in scenario_names:
         # The runner writes one file per (model, scenario), so we
@@ -302,6 +389,16 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         "--members", type=int, default=10,
         help="Ensemble members per model (default: 10).",
     )
+    p.add_argument(
+        "--mode", choices=("emissions", "concentrations", "both"),
+        default="both",
+        help=(
+            "Whether to dispatch each (model, scenario) pair through the "
+            "adapter's emissions-driven path, concentration-driven path, or "
+            "both (default). Concentration-driven mode skips esm-flat* "
+            "scenarios because they are emissions-driven by construction."
+        ),
+    )
     group = p.add_mutually_exclusive_group()
     group.add_argument(
         "--scenarios", nargs="+", default=None,
@@ -356,21 +453,34 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return 1
 
+    modes = VALID_MODES if args.mode == "both" else (args.mode,)
     print(
         "RCMIP3 protocol runner\n"
         f"  models:       {', '.join(args.models)}\n"
+        f"  modes:        {', '.join(modes)}\n"
         f"  members:      {args.members}\n"
         f"  scenarios:    {len(requested)} ({', '.join(requested)})\n"
         f"  output-dir:   {args.output_dir}\n"
         f"  cache-dir:    {args.cache_dir}\n"
     )
 
-    scenarios = load_rcmip3_emissions(list(requested), cache_dir=args.cache_dir)
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-    writer = NetCDFChunkWriter(args.output_dir)
+    scenarios_all = load_rcmip3_emissions(
+        list(requested), cache_dir=args.cache_dir
+    )
 
-    for model_alias in args.models:
-        _run_one_model(model_alias, scenarios, args.members, writer)
+    for mode in modes:
+        scen_subset = _scenarios_for_mode(requested, mode)
+        if not scen_subset:
+            LOGGER.warning("Mode %s has no eligible scenarios; skipping.", mode)
+            continue
+        scenarios_for_mode = scenarios_all.filter(scenario=list(scen_subset))
+        mode_dir = args.output_dir / mode
+        mode_dir.mkdir(parents=True, exist_ok=True)
+        writer = NetCDFChunkWriter(mode_dir)
+        for model_alias in args.models:
+            _run_one_model(
+                model_alias, mode, scenarios_for_mode, args.members, writer
+            )
 
     return 0
 
