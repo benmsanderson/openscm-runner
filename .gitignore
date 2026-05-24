@@ -181,3 +181,4 @@ dmypy.json
 *.swp
 
 configurations/
+scenario_data/
