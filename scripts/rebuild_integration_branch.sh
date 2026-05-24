@@ -36,6 +36,13 @@ BRANCHES=(
   modernisation/scmdata-pandas3
   modernisation/iamc-loader
   modernisation/cross-model-notebooks
+  # rcmip3-* branches are stacked: rcmip3-notebooks already contains
+  # all of -runner which already contains all of -inputs. Listing them
+  # in dependency order keeps three explicit merge commits in the
+  # integration history so each PR has a recognisable landing point.
+  modernisation/rcmip3-inputs
+  modernisation/rcmip3-runner
+  modernisation/rcmip3-notebooks
 )
 
 INTEGRATION_BRANCH="modernisation/integration"
