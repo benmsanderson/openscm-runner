@@ -5,10 +5,7 @@ Applied once when :mod:`openscm_runner` is imported. The patches edit
 ``scmdata.groupby`` and ``scmdata._xarray`` in place and are idempotent;
 re-importing this module is a no-op once the patches have been applied.
 
-Two pandas 3.0 breakages are addressed. Both surface as soon as
-:meth:`openscm_runner.run.run` returns more than one scenario worth of
-output, since the runner's per-scenario chunking and any downstream
-``ScmRun.to_nc`` write both pass through the affected scmdata code:
+Three pandas 3.0 breakages are addressed:
 
 1. :func:`scmdata.groupby.RunGroupBy.__init__` uses
    ``numpy.issubdtype(col.dtype, numpy.number)`` to detect numeric
@@ -25,7 +22,16 @@ output, since the runner's per-scenario chunking and any downstream
    indexing on label-indexed Series, so ``[0]`` raises ``KeyError: 0``.
    Replace with ``.iloc[0]``.
 
-Both fixes have been proposed upstream as a single PR against
+3. :meth:`scmdata.run.ScmRun.convert_unit` contains an inner
+   ``apply_units`` closure that does ``group._df.values[:] = ...``.
+   In pandas 3.0, ``DataFrame.values`` always returns a read-only numpy
+   array (the change applies even to ``DataFrame.copy()`` results), so
+   the in-place write raises ``ValueError: assignment destination is
+   read-only``.  Patch ``convert_unit`` to use ``group._df.iloc[:, :]``
+   for the assignment, which does not go through the read-only array
+   path.
+
+All three fixes have been proposed upstream as a single PR against
 ``openscm/scmdata``; this module exists so that openscm-runner users
 on pandas 3.0 are not blocked while we wait for a release. Once a
 patched scmdata is on PyPI the module (and the import-time
@@ -94,6 +100,68 @@ def apply_scmdata_patches() -> None:
         return max_count == 1
 
     _xarray._many_to_one = _patched_many_to_one
+
+    # --- Patch 3: convert_unit inner closure uses read-only .values[:] ---
+    # scmdata.run imports _get_target and run_append as module-level names;
+    # reach them via the module reference so the patch stays in sync with
+    # whatever version is actually installed.
+    import scmdata.run as _scmdata_run
+
+    _orig_convert_unit = _scmdata_run.ScmRun.convert_unit
+
+    def _patched_convert_unit(self, unit, context=None, inplace=False, **kwargs):
+        # Identical to the upstream implementation in scmdata 0.18.0 except
+        # the inner apply_units closure replaces
+        #   group._df.values[:] = uc.convert_from(group._df.values)
+        # with
+        #   group._df.iloc[:, :] = uc.convert_from(group._df.values)
+        # because pandas 3.0 makes DataFrame.values always read-only.
+        from scmdata.units import UnitConverter as _UC
+
+        _get_target = _scmdata_run._get_target
+        _run_append = _scmdata_run.run_append
+
+        ret = _get_target(self, inplace)
+
+        to_convert_filtered = ret.filter(**kwargs, log_if_empty=False)
+        to_not_convert_filtered = ret.filter(**kwargs, keep=False, log_if_empty=False)
+
+        already_correct_unit = to_convert_filtered.filter(unit=unit, log_if_empty=False)
+        if (
+            "unit_context" in already_correct_unit.meta_attributes
+            and not already_correct_unit.empty
+        ):
+            self._check_unit_context(already_correct_unit, context)
+
+        to_convert = to_convert_filtered.filter(
+            unit=unit, log_if_empty=False, keep=False
+        )
+        to_not_convert = _run_append([to_not_convert_filtered, already_correct_unit])
+
+        if "unit_context" in to_convert.meta_attributes and not to_convert.empty:
+            self._check_unit_context(to_convert, context)
+
+        if context is not None:
+            to_convert["unit_context"] = context
+
+        if "unit_context" not in to_not_convert.meta_attributes and context is not None:
+            to_not_convert["unit_context"] = None
+
+        def apply_units(group):
+            orig_unit = group.get_unique_meta("unit", no_duplicates=True)
+            uc = _UC(orig_unit, unit, context=context)
+            group._df.iloc[:, :] = uc.convert_from(group._df.values)
+            group["unit"] = unit
+            return group
+
+        ret = to_convert
+        if not to_convert.empty:
+            ret = ret.groupby("unit").apply(apply_units)
+
+        ret = _run_append([ret, to_not_convert], inplace=inplace)
+        return ret
+
+    _scmdata_run.ScmRun.convert_unit = _patched_convert_unit
 
     groupby._openscm_runner_patches_applied = True
     LOGGER.debug(
