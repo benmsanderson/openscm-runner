@@ -33,6 +33,9 @@ BRANCHES=(
   modernisation/netcdf-writer
   modernisation/fair2-adapter
   modernisation/ciceroscmpy2-adapter
+  modernisation/scmdata-pandas3
+  modernisation/iamc-loader
+  modernisation/cross-model-notebooks
 )
 
 INTEGRATION_BRANCH="modernisation/integration"
