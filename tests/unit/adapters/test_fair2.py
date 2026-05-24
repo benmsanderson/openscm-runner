@@ -210,6 +210,36 @@ def test_fair2_translated_cfg_warns_on_unknown_parameter_names(caplog):
     assert "ignored unknown parameter names" in caplog.text
 
 
+def test_fair2_stochastic_run_default_is_off():
+    """
+    The AR7-relevant fair-calibrate bundles ship
+    `climate_configs['stochastic_run']=True` for every posterior
+    member, which adds an AR(1) natural-variability term on top of
+    each member's deterministic trajectory. openscm-runner's typical
+    use case is comparing medians + spreads across scenarios, which
+    is cleaner with parameter-only spread; the adapter overrides
+    `stochastic_run` back to False by default. Set
+    `fair2_stochastic_run=True` in the cfg to opt back in.
+
+    Pins the contract by inspecting the threaded-through default of
+    `_run_one_calibration`; the actual override against
+    `f.climate_configs['stochastic_run']` is exercised by the
+    integration test (gated on FAIR2_CALIBRATION_PATH) and by the
+    cross-model notebook on `modernisation/integration`.
+    """
+    import inspect
+
+    from openscm_runner.adapters.fair2_adapter.fair2_adapter import (
+        _run_one_calibration,
+    )
+    sig = inspect.signature(_run_one_calibration)
+    assert sig.parameters["stochastic_run"].default is False, (
+        "_run_one_calibration's stochastic_run kwarg must default to "
+        "False so the adapter overrides the calibration's "
+        "stochastic_run=True. See module docstring."
+    )
+
+
 def test_fair2_conc_driven_requires_bundle_dir(tmp_path):
     """
     Setting ``fair2_conc_driven=True`` without ``fair2_conc_bundle_dir``

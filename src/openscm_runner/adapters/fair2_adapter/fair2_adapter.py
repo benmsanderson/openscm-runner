@@ -182,6 +182,7 @@ def _run_native_cfgs(scenarios, cfgs, output_variables) -> ScmRun:
                 "fair2_conc_gases_ep",
                 "gases_vupdate_2024_WMO_added_new.txt",
             ),
+            stochastic_run=cfg.get("fair2_stochastic_run", False),
         )
         results.append(scmrun_chunk)
         run_id_offset += len(members)
@@ -382,7 +383,7 @@ def _run_translated_cfgs(  # noqa: PLR0912, PLR0915
     )
 
 
-def _run_one_calibration(  # noqa: PLR0913
+def _run_one_calibration(  # noqa: PLR0912, PLR0913, PLR0915
     scenarios,
     calibration: NativeFairCalibration,
     members: pd.DataFrame,
@@ -391,6 +392,7 @@ def _run_one_calibration(  # noqa: PLR0913
     conc_driven=None,
     conc_bundle_dir=None,
     conc_gases_ep="gases_vupdate_2024_WMO_added_new.txt",
+    stochastic_run: bool = False,
 ) -> ScmRun:
     """
     Run FaIR 2.x once with a single calibration choice and return the
@@ -416,6 +418,18 @@ def _run_one_calibration(  # noqa: PLR0913
     run emissions-driven; everything else runs concentration-driven
     if ``conc_bundle_dir`` is provided. With no bundle, defaults to
     emissions-driven regardless of scenario name.
+
+    Stochastic forcing (``stochastic_run``) controls FaIR 2.x's
+    AR(1) natural-variability term on the energy-balance model
+    (Cummins et al. 2020). Default is ``False`` so the per-member
+    trajectories are deterministic given the calibration parameters
+    - i.e. ensemble spread reflects parameter uncertainty only, not
+    internal-variability noise on top. The AR7-relevant
+    ``fair-calibrate`` bundles ship ``stochastic_run=True`` for
+    every posterior member (with per-member ``sigma_eta`` /
+    ``sigma_xi`` / ``seed``); the adapter overrides this back to
+    ``False`` after loading the calibration parameters. Set
+    ``fair2_stochastic_run=True`` in the cfg to opt back in.
     """
     from fair.io import read_properties
 
@@ -530,6 +544,27 @@ def _run_one_calibration(  # noqa: PLR0913
     # into FaIR's config dimension.
     f.fill_species_configs(filename=calibration.file("species_configs"))
     f.override_defaults(calibration.file("parameters"))
+
+    # SCIENTIFIC CHOICE: the AR7-relevant fair-calibrate bundles ship
+    # `stochastic_run=True` for every posterior member, which adds an
+    # AR(1) natural-variability term (Cummins et al. 2020) on top of
+    # the deterministic per-member trajectory. Per-member ensemble
+    # spread then reflects parameter uncertainty AND internal noise.
+    # For openscm-runner's typical use case (compare medians + spreads
+    # across scenarios) we want parameter-only spread by default, so
+    # we flip stochastic_run back to False here. Set
+    # `fair2_stochastic_run=True` in the cfg to opt back in (useful
+    # for variability-focused studies; bundle still drives the
+    # sigma_eta / sigma_xi / seed values).
+    if not stochastic_run:
+        f.climate_configs["stochastic_run"][:] = False
+    else:
+        LOGGER.info(
+            "FaIRv2: stochastic_run=True; per-member trajectories include "
+            "AR(1) natural-variability noise on top of the parameter "
+            "posterior. Bundle's sigma_eta / sigma_xi / seed values are "
+            "used."
+        )
 
     # Splice the bundle's historical emissions with the user's scenario
     # data and let FaIR ingest the combined frame. Bundle historical
