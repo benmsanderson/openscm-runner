@@ -94,7 +94,15 @@ LOGGER = logging.getLogger("rcmip3-runner")
 # ---------------------------------------------------------------------------
 
 _OUTPUT_VARIABLES: tuple[str, ...] = (
+    # GSAT (2m over land + 2m over ocean): the variable historically
+    # reported as the model's "temperature anomaly", used in the
+    # plotting notebooks.
     "Surface Air Temperature Change",
+    # Blended (2m over land + SST over ocean): what observational
+    # records like HadCRUT/IGCC measure, and the variable Marit's
+    # native RCMIP3 submissions report for validation against this
+    # adapter. Both adapters compute this natively.
+    "Surface Air Ocean Blended Temperature Change",
     "Atmospheric Concentrations|CO2",
     "Atmospheric Concentrations|CH4",
     "Effective Radiative Forcing",
@@ -118,22 +126,63 @@ _SCENARIO_SETS: dict[str, tuple[str, ...]] = {
         "ssp119", "ssp126", "ssp245", "ssp370",
         "ssp434", "ssp460", "ssp534-over", "ssp585",
     ),
+    "esm-ssps": tuple(
+        f"esm-ssp{s}" for s in ("119", "126", "245", "370",
+                                "434", "460", "534-over", "585")
+    ),
+    "esm-allghg-ssps": tuple(
+        f"esm-allGHG-ssp{s}" for s in ("119", "126", "245", "370",
+                                       "434", "460", "534-over", "585")
+    ),
+    "ssp-sensitivity": (
+        "esm-allGHG-ssp370-lowCH4",
+        "esm-allGHG-ssp370-lowNTCF",
+        "esm-allGHG-ssp370-lowNTCF-HighCH4",
+        "esm-allGHG-ssp534-over-highCH4",
+        "esm-allGHG-ssp585-lowCH4",
+    ),
     "scen7": (
         "scen7-VL", "scen7-LN", "scen7-L", "scen7-ML",
         "scen7-M", "scen7-H", "scen7-HL",
     ),
+    "scen7-cd": (
+        "scen7-HC", "scen7-HLC", "scen7-LC", "scen7-LNC",
+        "scen7-MC", "scen7-MLC", "scen7-VLC",
+    ),
+    "esm-scen7": tuple(
+        f"esm-scen7-{x}" for x in ("VL", "LN", "L", "ML", "M", "H", "HL")
+    ),
+    "esm-allghg-scen7": tuple(
+        f"esm-allGHG-scen7-{x}"
+        for x in ("VL", "LN", "L", "ML", "M", "H", "HL")
+    ) + ("esm-allGHG-scen7-H-CH4L", "esm-allGHG-scen7-L-CH4H"),
     "flat": tuple(
         f"esm-flat{base}{suffix}"
         for base in ("7.5", "10", "20")
         for suffix in ("", "-zec", "-cdr", "-nz", "-rev")
     ),
-    "historical": ("historical",),
+    "bell": ("esm-bell-750PgC", "esm-bell-1000PgC", "esm-bell-2000PgC"),
+    "pulse": ("esm-pi-CO2pulse", "esm-pi-cdr-pulse"),
+    "1pct-brch": (
+        "esm-1pct-brch-750PgC",
+        "esm-1pct-brch-1000PgC",
+        "esm-1pct-brch-2000PgC",
+    ),
+    "abrupt": ("abrupt-0p5xCO2", "abrupt-2xCO2", "abrupt-4xCO2"),
+    "1pctco2": ("1pctCO2", "1pctCO2-4xext", "1pctCO2-cdr"),
+    "historical": (
+        "historical", "historical-cmip6",
+        "esm-hist", "esm-hist-cmip6",
+        "esm-allGHG-hist", "esm-allGHG-hist-cmip6",
+        "hist-aer", "hist-CO2", "hist-GHG",
+    ),
+    "picontrol": ("piControl", "esm-piControl", "esm-allGHG-piControl"),
 }
-_SCENARIO_SETS["all"] = (
-    _SCENARIO_SETS["ssps"]
-    + _SCENARIO_SETS["scen7"]
-    + _SCENARIO_SETS["flat"]
-    + _SCENARIO_SETS["historical"]
+# Union of every individual set. Excludes the 4 shelved scenarios
+# (1pctCO2-bgc/-rad need non-standard model config; methanemip-*
+# need scenario-specific MethaneMIP inputs not yet wired).
+_SCENARIO_SETS["all"] = tuple(
+    sorted(set().union(*(v for k, v in _SCENARIO_SETS.items())))
 )
 
 
