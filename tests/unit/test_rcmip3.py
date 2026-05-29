@@ -281,13 +281,30 @@ def test_protocol_metadata_spot_checks():
         assert actual == expected, f"{pid}: expected {expected}, got {actual}"
 
 
-def test_co2_only_property_derived_from_protocol_mode():
-    # The co2_only flag the loader's mask reads must always agree with
-    # protocol_mode == "ED-CO2-only"; this guards the property against
-    # future drift.
+def test_is_mixed_mode_property_matches_secondary_source_presence():
+    # Mixed-mode scenarios source CO2 emissions from one CSV and
+    # non-CO2 concentrations from another. The is_mixed_mode property
+    # is True iff secondary_source is set; this is the loader's
+    # dispatch signal.
     from openscm_runner.scenarios.rcmip3 import _REGISTRY
     for pid, spec in _REGISTRY.items():
-        assert spec.co2_only == (spec.protocol_mode == "ED-CO2-only"), pid
+        assert spec.is_mixed_mode == (spec.secondary_source is not None), pid
+
+
+def test_mixed_mode_only_set_for_esm_ssp_and_esm_hist():
+    # B-partial scope: mixed mode lives on esm-ssp* and esm-hist*
+    # families (where the RCMIP3 archive ships both em and conc for
+    # the bare source row). esm-scen7-* doesn't get mixed mode (no
+    # scen7 conc in the v1.1.7 archive) and falls back to all-GHG ED.
+    from openscm_runner.scenarios.rcmip3 import _REGISTRY
+    mixed = sorted(p for p, s in _REGISTRY.items() if s.is_mixed_mode)
+    expected = sorted([
+        "esm-hist", "esm-hist-cmip6",
+        *(f"esm-ssp{n}" for n in (
+            "119", "126", "245", "370", "434", "460", "534-over", "585",
+        )),
+    ])
+    assert mixed == expected
 
 
 def test_load_emissions_writes_protocol_meta_columns(tmp_path):
@@ -299,6 +316,13 @@ def test_load_emissions_writes_protocol_meta_columns(tmp_path):
              "Unit": "Mt CO2/yr"},
         ],
     )
+    _write_rcmip3_conc_like_csv(
+        tmp_path / _SOURCE_RCMIP3_CONC.cache_filename,
+        rows=[
+            {"Scenario": "ssp245",
+             "Variable": "Atmospheric Concentrations|CH4", "Unit": "ppb"},
+        ],
+    )
     run = load_rcmip3_emissions(
         ["ssp245", "esm-ssp245", "esm-allGHG-ssp245"],
         cache_dir=tmp_path, download_if_missing=False,
@@ -307,43 +331,56 @@ def test_load_emissions_writes_protocol_meta_columns(tmp_path):
         assert col in run.meta.columns, f"missing meta col {col!r}"
     by_scen = run.meta.set_index("scenario")[list(_PROTOCOL_META_COLS)]
     assert by_scen.loc["ssp245", "protocol_mode"] == "CD"
-    assert by_scen.loc["esm-ssp245", "protocol_mode"] == "ED-CO2-only"
+    # esm-ssp245 has multiple rows now (em + conc) but all share mode tag.
+    esm_mode = run.filter(scenario="esm-ssp245")["protocol_mode"].unique().tolist()
+    assert esm_mode == ["ED-CO2-only"]
     assert by_scen.loc["esm-allGHG-ssp245", "protocol_mode"] == "ED-all-GHG"
     # All three SSP variants are real-world, so natural/LU are identical.
     for scen in ("ssp245", "esm-ssp245", "esm-allGHG-ssp245"):
-        assert by_scen.loc[scen, "protocol_natural_forcing"] == "on"
-        assert by_scen.loc[scen, "protocol_land_use_forcing"] == "historical"
+        sub = run.filter(scenario=scen)
+        assert sub["protocol_natural_forcing"].unique().tolist() == ["on"]
+        assert sub["protocol_land_use_forcing"].unique().tolist() == ["historical"]
 
 
-def test_load_emissions_meta_survives_co2_only_mask(tmp_path):
-    # Regression guard: the mask reconstructs a fresh ScmRun via
-    # (data, index, columns), so any meta col that isn't explicitly
-    # carried across would get dropped. esm-ssp245 goes through the
-    # mask; meta cols must still be present afterwards.
+def test_load_emissions_meta_propagates_across_mixed_mode_concat(tmp_path):
+    # Regression guard: the mixed-mode loader concatenates two ScmRuns
+    # (primary em + secondary conc). The protocol meta cols must
+    # appear on BOTH halves so the concatenated run has consistent
+    # values across every row.
     _write_rcmip3_like_csv(
         tmp_path / _SOURCE_RCMIP3.cache_filename,
         rows=[
             {"Scenario": "ssp245",
              "Variable": "Emissions|CO2|Energy and Industrial Processes",
              "Unit": "Mt CO2/yr"},
+        ],
+    )
+    _write_rcmip3_conc_like_csv(
+        tmp_path / _SOURCE_RCMIP3_CONC.cache_filename,
+        rows=[
             {"Scenario": "ssp245",
-             "Variable": "Emissions|CH4",
-             "Unit": "Mt CH4/yr"},
+             "Variable": "Atmospheric Concentrations|CH4", "Unit": "ppb"},
         ],
     )
     run = load_rcmip3_emissions(
         ["esm-ssp245"], cache_dir=tmp_path, download_if_missing=False,
     )
-    meta = run.meta.drop_duplicates(subset=["scenario"]).iloc[0]
-    assert meta["protocol_mode"] == "ED-CO2-only"
-    assert meta["protocol_natural_forcing"] == "on"
-    assert meta["protocol_land_use_forcing"] == "historical"
+    # Single (mode, natural, LU) value across both emissions and conc
+    # rows of the mixed-mode scenario.
+    assert run["protocol_mode"].unique().tolist() == ["ED-CO2-only"]
+    assert run["protocol_natural_forcing"].unique().tolist() == ["on"]
+    assert run["protocol_land_use_forcing"].unique().tolist() == ["historical"]
+    # Both variable namespaces present (the mixed-mode shape).
+    variables = sorted(run["variable"].unique())
+    assert "Emissions|CO2|MAGICC Fossil and Industrial" in variables
+    assert "Atmospheric Concentrations|CH4" in variables
 
 
 def test_step5a_esm_hist_variants_source_map_to_historical_row(tmp_path):
-    # esm-hist / esm-allGHG-hist source-map onto the bare `historical`
-    # row in the RCMIP3 CSV; esm-hist gets CO2-only masking via the
-    # protocol_mode flag, esm-allGHG-hist passes through unmasked.
+    # esm-hist source-maps onto the bare `historical` row but is
+    # mixed mode (CO2 emissions from em CSV, CH4 concentration from
+    # conc CSV). esm-allGHG-hist source-maps to the same row but
+    # without secondary -> full all-GHG emissions.
     _write_rcmip3_like_csv(
         tmp_path / _SOURCE_RCMIP3.cache_filename,
         rows=[
@@ -355,16 +392,29 @@ def test_step5a_esm_hist_variants_source_map_to_historical_row(tmp_path):
              "Unit": "Mt CH4/yr", "2020": 300.0},
         ],
     )
+    _write_rcmip3_conc_like_csv(
+        tmp_path / _SOURCE_RCMIP3_CONC.cache_filename,
+        rows=[
+            {"Scenario": "historical",
+             "Variable": "Atmospheric Concentrations|CH4",
+             "Unit": "ppb", "2020": 1850.0},
+        ],
+    )
     run = load_rcmip3_emissions(
         ["esm-hist", "esm-allGHG-hist"],
         cache_dir=tmp_path, download_if_missing=False,
     )
     ts = run.timeseries(time_axis="year").reset_index()
-    ch4_by_scen = ts[ts["variable"] == "Emissions|CH4"].set_index("scenario")[2020]
-    # esm-hist is ED-CO2-only -> CH4 zeroed by loader mask
-    assert ch4_by_scen["esm-hist"] == 0.0
-    # esm-allGHG-hist is ED-all-GHG -> CH4 passthrough
-    assert ch4_by_scen["esm-allGHG-hist"] == 300.0
+    em_ch4 = ts[ts["variable"] == "Emissions|CH4"].set_index("scenario")[2020]
+    conc_ch4 = ts[
+        ts["variable"] == "Atmospheric Concentrations|CH4"
+    ].set_index("scenario")[2020]
+    # esm-hist (mixed): no Emissions|CH4, has Atmospheric Concentrations|CH4
+    assert "esm-hist" not in em_ch4.index
+    assert conc_ch4.loc["esm-hist"] == 1850.0
+    # esm-allGHG-hist (single source): has Emissions|CH4, no conc
+    assert em_ch4.loc["esm-allGHG-hist"] == 300.0
+    assert "esm-allGHG-hist" not in conc_ch4.index
 
 
 def test_step5c_ch4_swap_loads_from_translated_bundle():
@@ -513,41 +563,52 @@ def test_load_bundle_only_returns_stub_with_scenario_name(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# CO2-only ED mask (esm-* non-allGHG variants of SSPs and scen7-*)
+# Mixed-mode ED CO2-only (esm-ssp* / esm-hist*: CO2 em + non-CO2 conc)
 # ---------------------------------------------------------------------------
 
 
-def test_registry_has_esm_ssp_co2_only_and_allghg_passthrough():
-    # Step 2 promotes esm-ssp* / esm-allGHG-ssp* out of bundle-only:
-    # both should now point at the bare ssp* source row in the RCMIP3
-    # CSV, with the co2_only flag distinguishing them.
-    from openscm_runner.scenarios.rcmip3 import _REGISTRY, _SOURCE_RCMIP3
+def test_registry_esm_ssp_uses_mixed_mode_primary_em_secondary_conc():
+    # esm-ssp245 reads CO2 emissions from the bare ssp245 row in the
+    # emissions CSV (primary) AND non-CO2 concentrations from the
+    # bare ssp245 row in the concentrations CSV (secondary).
+    from openscm_runner.scenarios.rcmip3 import (
+        _REGISTRY, _SOURCE_RCMIP3, _SOURCE_RCMIP3_CONC,
+    )
     spec_co2 = _REGISTRY["esm-ssp245"]
     spec_all = _REGISTRY["esm-allGHG-ssp245"]
+    # esm-ssp245: mixed mode (CO2 em + non-CO2 conc)
     assert spec_co2.source is _SOURCE_RCMIP3
     assert spec_co2.source_scenario == "ssp245"
-    assert spec_co2.co2_only is True
+    assert spec_co2.secondary_source is _SOURCE_RCMIP3_CONC
+    assert spec_co2.secondary_source_scenario == "ssp245"
+    assert spec_co2.is_mixed_mode is True
+    # esm-allGHG-ssp245: single source (full emissions, no mixed mode)
     assert spec_all.source is _SOURCE_RCMIP3
     assert spec_all.source_scenario == "ssp245"
-    assert spec_all.co2_only is False
+    assert spec_all.is_mixed_mode is False
 
 
-def test_registry_has_esm_scen7_co2_only_and_allghg_passthrough():
+def test_registry_esm_scen7_has_no_mixed_mode_falls_back_to_all_ghg_ed():
+    # esm-scen7-H is tagged ED-CO2-only but the RCMIP3 v1.1.7 conc
+    # archive doesn't ship scen7-* concentrations (CMIP7-only). The
+    # registry omits secondary_source so the scenario runs as
+    # all-GHG ED (same primary source as esm-allGHG-scen7-H).
     from openscm_runner.scenarios.rcmip3 import _REGISTRY, _SOURCE_SCEN7
     spec_co2 = _REGISTRY["esm-scen7-H"]
     spec_all = _REGISTRY["esm-allGHG-scen7-H"]
     assert spec_co2.source is _SOURCE_SCEN7
     assert spec_co2.source_scenario == "SSP3 - High Emissions"
     assert spec_co2.source_model == "GCAM 8s"
-    assert spec_co2.co2_only is True
-    assert spec_all.co2_only is False
+    assert spec_co2.is_mixed_mode is False  # no secondary, falls back
+    assert spec_all.is_mixed_mode is False
     assert spec_all.source_scenario == spec_co2.source_scenario
 
 
-def test_load_esm_ssp_zeros_non_co2_keeps_co2_sector_splits(tmp_path):
-    # esm-ssp245 reads from the bare ssp245 source row; non-CO2 species
-    # come back as zeros (the ED CO2-only protocol) while the two CO2
-    # sector splits pass through unchanged.
+def test_load_esm_ssp_mixed_mode_returns_co2_em_and_non_co2_conc(tmp_path):
+    # esm-ssp245 in B-partial: protocol-correct mixed mode. CO2 sector
+    # splits come from the emissions CSV (primary); CH4/N2O/HFC etc.
+    # come as Atmospheric Concentrations from the conc CSV (secondary).
+    # No masking — non-CO2 emissions are simply not present in the output.
     _write_rcmip3_like_csv(
         tmp_path / _SOURCE_RCMIP3.cache_filename,
         rows=[
@@ -561,11 +622,25 @@ def test_load_esm_ssp_zeros_non_co2_keeps_co2_sector_splits(tmp_path):
              "Variable": "Emissions|CH4",
              "Unit": "Mt CH4/yr", "2050": 300.0},
             {"Scenario": "ssp245",
-             "Variable": "Emissions|N2O",
-             "Unit": "kt N2O/yr", "2050": 8000.0},
-            {"Scenario": "ssp245",
              "Variable": "Emissions|HFC|HFC125",
              "Unit": "kt HFC125/yr", "2050": 50.0},
+        ],
+    )
+    _write_rcmip3_conc_like_csv(
+        tmp_path / _SOURCE_RCMIP3_CONC.cache_filename,
+        rows=[
+            {"Scenario": "ssp245",
+             "Variable": "Atmospheric Concentrations|CO2",
+             "Unit": "ppm", "2050": 470.0},
+            {"Scenario": "ssp245",
+             "Variable": "Atmospheric Concentrations|CH4",
+             "Unit": "ppb", "2050": 1900.0},
+            {"Scenario": "ssp245",
+             "Variable": "Atmospheric Concentrations|N2O",
+             "Unit": "ppb", "2050": 350.0},
+            {"Scenario": "ssp245",
+             "Variable": "Atmospheric Concentrations|HFC|HFC125",
+             "Unit": "ppt", "2050": 70.0},
         ],
     )
     run = load_rcmip3_emissions(
@@ -574,11 +649,17 @@ def test_load_esm_ssp_zeros_non_co2_keeps_co2_sector_splits(tmp_path):
     assert run["scenario"].unique().tolist() == ["esm-ssp245"]
     ts = run.timeseries(time_axis="year").reset_index()
     by_var = dict(zip(ts["variable"], ts[2050]))
+    # Emissions: only the two CO2 sectors survive from the primary
     assert by_var["Emissions|CO2|MAGICC Fossil and Industrial"] == 35000.0
     assert by_var["Emissions|CO2|MAGICC AFOLU"] == 4500.0
-    assert by_var["Emissions|CH4"] == 0.0
-    assert by_var["Emissions|N2O"] == 0.0
-    assert by_var["Emissions|HFC125"] == 0.0
+    assert "Emissions|CH4" not in by_var  # dropped: comes as conc instead
+    assert "Emissions|HFC125" not in by_var
+    # Concentrations: non-CO2 species come from the secondary; CO2 conc
+    # is dropped (we drive CO2 by emissions, not concentration).
+    assert by_var["Atmospheric Concentrations|CH4"] == 1900.0
+    assert by_var["Atmospheric Concentrations|N2O"] == 350.0
+    assert by_var["Atmospheric Concentrations|HFC125"] == 70.0
+    assert "Atmospheric Concentrations|CO2" not in by_var
 
 
 def test_load_esm_allghg_ssp_passes_emissions_through_unmasked(tmp_path):
@@ -606,11 +687,11 @@ def test_load_esm_allghg_ssp_passes_emissions_through_unmasked(tmp_path):
 
 
 def test_load_co_request_of_three_protocol_variants_yields_distinct_rows(tmp_path):
-    # ssp245 (CD-style passthrough), esm-ssp245 (CO2-only) and
-    # esm-allGHG-ssp245 (all-GHG) all read the same source row.
-    # The loader must materialise three distinct scenario timeseries
-    # rather than collapsing them via the (source_scen, source_model)
-    # rename map.
+    # ssp245 (CD), esm-ssp245 (mixed mode), esm-allGHG-ssp245 (all-GHG ED)
+    # all draw from the ssp245 row but produce different ScmRuns:
+    # - ssp245: full emissions (Emissions|CH4 etc. present)
+    # - esm-ssp245: CO2 emissions + non-CO2 concentrations (mixed mode)
+    # - esm-allGHG-ssp245: full emissions (same as ssp245)
     _write_rcmip3_like_csv(
         tmp_path / _SOURCE_RCMIP3.cache_filename,
         rows=[
@@ -622,6 +703,14 @@ def test_load_co_request_of_three_protocol_variants_yields_distinct_rows(tmp_pat
              "Unit": "Mt CH4/yr", "2050": 300.0},
         ],
     )
+    _write_rcmip3_conc_like_csv(
+        tmp_path / _SOURCE_RCMIP3_CONC.cache_filename,
+        rows=[
+            {"Scenario": "ssp245",
+             "Variable": "Atmospheric Concentrations|CH4",
+             "Unit": "ppb", "2050": 1900.0},
+        ],
+    )
     run = load_rcmip3_emissions(
         ["ssp245", "esm-ssp245", "esm-allGHG-ssp245"],
         cache_dir=tmp_path, download_if_missing=False,
@@ -629,18 +718,29 @@ def test_load_co_request_of_three_protocol_variants_yields_distinct_rows(tmp_pat
     assert sorted(run["scenario"].unique()) == [
         "esm-allGHG-ssp245", "esm-ssp245", "ssp245",
     ]
-    # Non-CO2 should be zeroed for esm-ssp245 only.
     ts = run.timeseries(time_axis="year").reset_index()
-    ch4 = ts[ts["variable"] == "Emissions|CH4"].set_index("scenario")[2050]
-    assert ch4["ssp245"] == 300.0
-    assert ch4["esm-allGHG-ssp245"] == 300.0
-    assert ch4["esm-ssp245"] == 0.0
+    # Emissions|CH4: present on ssp245 + esm-allGHG-ssp245 (full
+    # emissions); ABSENT on esm-ssp245 (which uses CH4 conc instead).
+    ch4_em = ts[ts["variable"] == "Emissions|CH4"].set_index("scenario")[2050]
+    assert "ssp245" in ch4_em.index and ch4_em["ssp245"] == 300.0
+    assert "esm-allGHG-ssp245" in ch4_em.index and ch4_em["esm-allGHG-ssp245"] == 300.0
+    assert "esm-ssp245" not in ch4_em.index
+    # Atmospheric Concentrations|CH4: present only on esm-ssp245
+    ch4_conc = ts[
+        ts["variable"] == "Atmospheric Concentrations|CH4"
+    ].set_index("scenario")[2050]
+    assert ch4_conc.index.tolist() == ["esm-ssp245"]
+    assert ch4_conc["esm-ssp245"] == 1900.0
 
 
-def test_load_esm_scen7_uses_marker_iam_and_masks_non_co2(tmp_path):
+def test_load_esm_scen7_uses_marker_iam_no_mask_falls_back_to_all_ghg(tmp_path):
     # The scen7 CSV ships one row per (scenario, IAM) pair; esm-scen7-H
     # must filter to the GCAM marker (not other IAMs that happen to
-    # publish "SSP3 - High Emissions") and apply the CO2-only mask.
+    # publish "SSP3 - High Emissions").
+    #
+    # B-partial: esm-scen7-H has no secondary_source (no scen7 conc
+    # in the RCMIP3 archive), so it falls back to all-GHG ED — same
+    # data as esm-allGHG-scen7-H. Non-CO2 emissions are NOT masked.
     _write_scen7_like_csv(
         tmp_path / _SOURCE_SCEN7.cache_filename,
         rows=[
@@ -663,7 +763,8 @@ def test_load_esm_scen7_uses_marker_iam_and_masks_non_co2(tmp_path):
     ts = run.timeseries(time_axis="year").reset_index()
     by_var = dict(zip(ts["variable"], ts[2050]))
     assert by_var["Emissions|CO2|MAGICC Fossil and Industrial"] == 50000.0
-    assert by_var["Emissions|CH4"] == 0.0
+    # CH4 NOT masked — falls back to all-GHG ED.
+    assert by_var["Emissions|CH4"] == 400.0
 
 
 # ---------------------------------------------------------------------------

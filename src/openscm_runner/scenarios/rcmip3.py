@@ -133,23 +133,37 @@ _BUNDLE_TRANSLATED_PATH = (
 
 @dataclass(frozen=True)
 class _ScenarioSpec:
-    """How to fetch one protocol scenario from one upstream CSV.
+    """How to fetch one protocol scenario from one (or two) upstream CSVs.
 
     Attributes
     ----------
     source
-        Which upstream CSV holds this scenario.
+        Primary upstream CSV. For all scenarios this carries the
+        emissions (or, for CD scenarios loaded via the conc registry,
+        the concentrations).
     source_scenario
-        The scenario string as it appears in that CSV's ``scenario`` column.
+        The scenario string as it appears in the primary CSV's
+        ``scenario`` column.
     source_model
         Optional IAM-marker filter for sources that publish one scenario
         per IAM (the scen7 CSV does this; the RCMIP3 CSV typically has
         only one model row per scenario already).
+    secondary_source / secondary_source_scenario
+        Optional second upstream CSV, set when the scenario is in the
+        protocol's "ED CO2-only" mixed-driving mode. The primary then
+        contributes CO2 emissions only (``Emissions|CO2|*``) and the
+        secondary contributes non-CO2 concentrations only
+        (``Atmospheric Concentrations|*`` excluding CO2). The loader
+        concatenates them into a single ScmRun. CICEROSCM v2 cannot
+        consume this mixed input (its ``conc_run`` is all-or-nothing
+        per scenario, so it falls back to all-GHG ED matching Marit's
+        de facto reference); FaIR 2.x consumes both modes natively
+        via ``fill_from_pandas``.
     protocol_mode
         One of ``"CD"`` (concentration-driven), ``"ED-CO2-only"``
-        (emissions-driven with non-CO2 held at pre-industrial), or
-        ``"ED-all-GHG"`` (emissions-driven with all anthropogenic
-        emissions active). Adapters should consume this column rather
+        (emissions-driven CO2 + concentration-driven non-CO2, the
+        protocol's intent), or ``"ED-all-GHG"`` (emissions-driven for
+        all species). Adapters should consume this column rather
         than pattern-matching on the scenario name.
     protocol_natural_forcing
         ``"on"`` for runs that include historical solar/volcanic
@@ -164,14 +178,16 @@ class _ScenarioSpec:
     source: _Source
     source_scenario: str
     source_model: Optional[str] = None
+    secondary_source: Optional[_Source] = None
+    secondary_source_scenario: Optional[str] = None
     protocol_mode: str = "CD"
     protocol_natural_forcing: str = "on"
     protocol_land_use_forcing: str = "historical"
 
     @property
-    def co2_only(self) -> bool:
-        """Derived flag: True if the loader should mask non-CO2 emissions."""
-        return self.protocol_mode == "ED-CO2-only"
+    def is_mixed_mode(self) -> bool:
+        """True when the scenario sources CO2 emissions + non-CO2 conc separately."""
+        return self.secondary_source is not None
 
 
 # Six protocol profiles — every scenario in the registry matches one of
@@ -327,11 +343,22 @@ def _build_registry() -> dict[str, _ScenarioSpec]:
 
     # esm-ssp* / esm-allGHG-ssp* — ED variants of the SSPs, both read
     # from the bare ssp* source row in the RCMIP3 CSV (per the protocol
-    # README). CO2-only gets non-CO2 zeroed by the loader; all-GHG
-    # passes through.
+    # README).
+    #
+    # The ED-CO2-only variant is the protocol's mixed-mode driving: CO2
+    # from emissions, non-CO2 from concentrations. The loader emits
+    # both streams in a single ScmRun and FaIR consumes them via
+    # fill_from_pandas (mode="emissions" + mode="concentration"). CICERO
+    # v2 can't honor mixed mode (conc_run is all-or-nothing upstream),
+    # so its adapter detects the mixed-mode signal and falls back to
+    # the bundle's bare-name ssp*_em_* file — running full all-GHG ED,
+    # which matches Marit's published reference (her esm-ssp245 and
+    # esm-allGHG-ssp245 are bit-identical for the same reason).
     for s in _RCMIP3_SSPS:
         reg[f"esm-{s}"] = _ScenarioSpec(
-            source=_SOURCE_RCMIP3, source_scenario=s, **_PROFILE_ED_CO2_REAL,
+            source=_SOURCE_RCMIP3, source_scenario=s,
+            secondary_source=_SOURCE_RCMIP3_CONC, secondary_source_scenario=s,
+            **_PROFILE_ED_CO2_REAL,
         )
         reg[f"esm-allGHG-{s}"] = _ScenarioSpec(
             source=_SOURCE_RCMIP3, source_scenario=s, **_PROFILE_ED_ALLGHG_REAL,
@@ -378,6 +405,16 @@ def _build_registry() -> dict[str, _ScenarioSpec]:
         )
 
     # scen7 markers and their ED CO2-only / ED all-GHG siblings.
+    #
+    # ``esm-scen7-*`` is tagged ED-CO2-only but does NOT get a
+    # secondary_source: the RCMIP3 v1.1.7 concentrations archive does
+    # not ship scen7-* concentrations (they are CMIP7-only and
+    # post-date the archive). Without a non-CO2 concentration
+    # trajectory the loader can't materialise the mixed-mode input, so
+    # the scenario falls back to its primary emissions source — same
+    # data as ``esm-allGHG-scen7-*``. A future bundle translator for
+    # scen7-* ``_conc_*`` files (extending step 5c) would unlock the
+    # proper mixed-mode pathway here.
     for protocol_id, (source_scen, source_model) in _SCEN7_MARKERS.items():
         reg[protocol_id] = _ScenarioSpec(
             source=_SOURCE_SCEN7, source_scenario=source_scen,
@@ -422,14 +459,19 @@ def _build_registry() -> dict[str, _ScenarioSpec]:
     }
     # ED variants of historical / piControl that source-map onto rows
     # already present in the RCMIP3 emissions CSV. Step 5a moved these
-    # out of bundle-only so the loader feeds CICERO real CO2-only /
-    # all-GHG emissions via hybrid mode rather than a zero stub.
+    # out of bundle-only; B-partial adds the secondary_source for the
+    # CO2-only variants so they get proper mixed-mode driving via the
+    # historical concentrations CSV.
     reg["esm-hist"] = _ScenarioSpec(
         source=_SOURCE_RCMIP3, source_scenario="historical",
+        secondary_source=_SOURCE_RCMIP3_CONC,
+        secondary_source_scenario="historical",
         **_PROFILE_ED_CO2_REAL,
     )
     reg["esm-hist-cmip6"] = _ScenarioSpec(
         source=_SOURCE_RCMIP3, source_scenario="historical-cmip6",
+        secondary_source=_SOURCE_RCMIP3_CONC,
+        secondary_source_scenario="historical-cmip6",
         **_PROFILE_ED_CO2_REAL,
     )
     reg["esm-allGHG-hist"] = _ScenarioSpec(
@@ -683,20 +725,32 @@ def load_rcmip3_emissions(
             f"Known scenarios: {available_scenarios()}"
         )
 
-    by_source: dict[_Source, list[str]] = {}
+    # Split into three groups: bundle-only stubs, mixed-mode (CO2 em +
+    # non-CO2 conc), and primary-only single-source.
+    bundle_only_ids: list[str] = []
+    mixed_mode_ids: list[str] = []
+    primary_by_source: dict[_Source, list[str]] = {}
     for s in scenarios:
         spec = _REGISTRY[s]
-        by_source.setdefault(spec.source, []).append(s)
+        if spec.source is _SOURCE_BUNDLE_ONLY:
+            bundle_only_ids.append(s)
+        elif spec.is_mixed_mode:
+            mixed_mode_ids.append(s)
+        else:
+            primary_by_source.setdefault(spec.source, []).append(s)
 
     runs: list[scmdata.ScmRun] = []
-    for source, protocol_ids in by_source.items():
-        if source is _SOURCE_BUNDLE_ONLY:
-            runs.append(_make_bundle_only_stub(protocol_ids))
-            continue
+    if bundle_only_ids:
+        runs.append(_make_bundle_only_stub(bundle_only_ids))
+    for source, protocol_ids in primary_by_source.items():
         local = _ensure_source_cached(
-            source, cache_dir=cache_dir, download=download_if_missing
+            source, cache_dir=cache_dir, download=download_if_missing,
         )
         runs.append(_load_one_source(local, protocol_ids, registry=_REGISTRY))
+    for protocol_id in mixed_mode_ids:
+        runs.append(_load_mixed_mode_scenario(
+            protocol_id, cache_dir=cache_dir, download=download_if_missing,
+        ))
 
     if len(runs) == 1:
         return runs[0]
@@ -846,7 +900,7 @@ def _load_one_source(
         # produced a same-named scenario.
         base = base.filter(model=source_models)
 
-    # Materialise one ScmRun per protocol id with rename + mask applied.
+    # Materialise one ScmRun per protocol id with rename applied.
     runs: list[scmdata.ScmRun] = []
     for (source_scen, source_model), pids in by_row.items():
         filt: dict[str, object] = {"scenario": source_scen}
@@ -857,8 +911,6 @@ def _load_one_source(
             per_id = row_run.copy()
             per_id["scenario"] = pid
             spec = registry[pid]
-            if spec.co2_only:
-                per_id = _apply_co2_only_mask(per_id)
             _apply_protocol_metadata(per_id, spec)
             runs.append(per_id)
 
@@ -881,40 +933,74 @@ def _apply_protocol_metadata(run: scmdata.ScmRun, spec: _ScenarioSpec) -> None:
     run["protocol_land_use_forcing"] = spec.protocol_land_use_forcing
 
 
-# Variable names that survive the CO2-only mask. Held as a module-level
-# frozenset so the mask is a single isin() lookup. Concentrations are
-# not currently routed through the mask (only emissions scenarios are
-# tagged co2_only=True in the registry).
-_CO2_ONLY_KEEP_VARIABLES: frozenset[str] = frozenset({
+# The two CO2 emissions variables that survive the mixed-mode split.
+# Everything else from the primary (emissions) source gets dropped;
+# their concentration trajectories come from the secondary source.
+_CO2_EMISSIONS_VARIABLES: frozenset[str] = frozenset({
     "Emissions|CO2|MAGICC Fossil and Industrial",
     "Emissions|CO2|MAGICC AFOLU",
 })
 
 
-def _apply_co2_only_mask(run: scmdata.ScmRun) -> scmdata.ScmRun:
-    """Zero non-CO2 anthropogenic emissions for ED CO2-only mode.
+def _load_mixed_mode_scenario(
+    protocol_id: str, *, cache_dir: Path, download: bool,
+) -> scmdata.ScmRun:
+    """Load a single ED-CO2-only scenario in protocol-correct mixed mode.
 
-    The protocol's ED CO2-only mode holds non-CO2 anthropogenic emissions
-    at pre-industrial throughout the run; in the emissions ScmRun that
-    means zero (the SCM layers its own natural emissions on top
-    separately). The two CO2 sector splits (``MAGICC Fossil and
-    Industrial`` / ``MAGICC AFOLU``) pass through unchanged.
+    The protocol's "ED CO2-only" driving mode (``esm-ssp245``,
+    ``esm-hist``, etc.) wants CO2 from emissions input and all other
+    species from concentration input — within a single run. This helper
+    reads the spec's primary source (emissions CSV) for the two CO2
+    sector splits and the secondary source (concentrations CSV) for
+    every non-CO2 species, then concatenates them into one ScmRun with
+    the protocol id stamped on the ``scenario`` column.
 
-    The returned ScmRun keeps the same variables and timestamps as the
-    input — non-CO2 rows are zeroed rather than dropped so adapters
-    that key off the variable set don't see a different shape between
-    CO2-only and all-GHG runs.
+    FaIR 2.x consumes this directly via two ``fill_from_pandas`` calls
+    (one for ``mode="emissions"``, one for ``mode="concentration"``).
+    CICEROSCM v2 cannot — its ``conc_run`` is all-or-nothing per
+    scenario — so the CICEROSCM adapter detects the mixed-mode signal
+    and falls back to the bundle's bare-name ``_em_*`` file, running
+    full all-GHG ED (matching Marit's de facto reference).
     """
-    keep = run.meta["variable"].isin(_CO2_ONLY_KEEP_VARIABLES).to_numpy()
-    if keep.all():
-        return run
-    new_values = run.values.copy()
-    new_values[~keep, :] = 0.0
-    return scmdata.ScmRun(
-        data=new_values.T,
-        index=run.time_points.to_index(),
-        columns={c: run[c].tolist() for c in run.meta.columns},
+    spec = _REGISTRY[protocol_id]
+    if not spec.is_mixed_mode:
+        raise RuntimeError(
+            f"_load_mixed_mode_scenario called on {protocol_id!r}, which "
+            f"has no secondary_source (not in mixed mode)."
+        )
+
+    em_path = _ensure_source_cached(
+        spec.source, cache_dir=cache_dir, download=download,
     )
+    conc_path = _ensure_source_cached(
+        spec.secondary_source, cache_dir=cache_dir, download=download,
+    )
+
+    # Primary: read the emissions row, keep only the two CO2 sector
+    # splits (anything else gets replaced by the concentration twin).
+    em_run = load_iamc(
+        em_path, scenarios=[spec.source_scenario],
+        variables=list(_CO2_EMISSIONS_VARIABLES),
+    )
+    if spec.source_model is not None:
+        em_run = em_run.filter(model=spec.source_model)
+
+    # Secondary: read the conc row, keep everything except
+    # ``Atmospheric Concentrations|CO2`` (we drive CO2 by emissions).
+    conc_run = load_iamc(
+        conc_path, scenarios=[spec.secondary_source_scenario],
+    )
+    conc_run = conc_run.filter(
+        variable="Atmospheric Concentrations|CO2", keep=False,
+    )
+
+    # Rename scenario col on both to the protocol id and stamp meta.
+    em_run["scenario"] = protocol_id
+    conc_run["scenario"] = protocol_id
+    _apply_protocol_metadata(em_run, spec)
+    _apply_protocol_metadata(conc_run, spec)
+
+    return scmdata.run_append([em_run, conc_run])
 
 
 # ---------------------------------------------------------------------------
