@@ -905,25 +905,87 @@ def _build_scendata_list_bundle(  # noqa: PLR0912, PLR0915
         em_candidates = [f"{b}_em_{gases_ep}" for b in basenames]
         em_bundle_match = _find_bundle_file(bundle_dir, em_candidates)
 
-        # ED-CO2-only scenarios share their bundle file with the bare
-        # variant (e.g. esm-ssp245 strips to ssp245_em_), but that
-        # bundle file carries full-GHG emissions while the protocol
-        # requires non-CO2 zeroed. Prefer hybrid mode so the loader's
-        # already-masked ScmRun drives the run rather than the wrong
-        # bundle file. Scenarios with a scenario-specific bundle file
-        # (esm-flat10_em_*, esm-piControl_em_*, the CH4-swap variants)
-        # still hit the exact-name match and skip the strip.
         em_bundle_is_stripped = (
             em_bundle_match is not None
             and os.path.basename(em_bundle_match) != em_candidates[0]
         )
-        prefer_hybrid_for_co2_only = (
-            spec["mode"] == "ED-CO2-only" and em_bundle_is_stripped
+
+        # Idealised scenarios (natural=off + LU=constant_zero, e.g.
+        # 1pctCO2, abrupt-*, piControl) want PI-flat anthropogenic
+        # emissions everywhere so CICEROSCM's calc_aerosol_forcing
+        # (concentrations_emissions_handler.py:584) — which computes
+        # ``q = (emis[yr] - emis[1750]) * ALPHA`` for each aerosol
+        # tracer regardless of conc_run mode — produces zero aerosol
+        # perturbation. Without this, the default fallback to
+        # historical_em_ leaks historical SO2 / BC / OC / NOx / NH3 /
+        # NMVOC / CH4 into the idealised runs and breaks the "only CO2
+        # varies" protocol invariant. This is the fourth member of the
+        # idealised-suppression set: sunvolc=0, natemis flatten,
+        # LUC=constant_zero, and now PI-flat emissions.
+        #
+        # Scenarios that ship a scenario-specific _em_ file (esm-flat*,
+        # esm-bell-*, esm-pi-*, esm-piControl) hit the exact-name match
+        # above; their files are CO2-only by construction so aerosols
+        # are already PI-flat. The fix only affects scenarios that
+        # would otherwise fall through to the historical_em_ fallback
+        # (1pctCO2*, abrupt-*, piControl, the bundle-only esm-1pct-brch-*).
+        idealised = natural_off and lu_zero
+        em_fallback_chain = (
+            [f"esm-piControl_em_{gases_ep}", f"historical_em_{gases_ep}"]
+            if idealised else [f"historical_em_{gases_ep}"]
         )
 
+        # Detect protocol-strict mixed-mode input from the loader: the
+        # presence of Atmospheric Concentrations|* rows for this
+        # scenario means the loader is supplying ED CO2-only inputs
+        # (CO2 from emissions + non-CO2 from concentrations) — see
+        # openscm_runner.scenarios.rcmip3._load_mixed_mode_scenario.
+        # CICEROSCM v2's conc_run is all-or-nothing per scenario
+        # (concentrations_emissions_handler.py guards on a single
+        # pamset flag, no per-species toggle), so we cannot honor the
+        # protocol-strict mode here. Fall back to the bundle's
+        # bare-name _em_ file via stripping, running full all-GHG ED.
+        # This matches Marit's published reference (her esm-ssp245
+        # and esm-allGHG-ssp245 are bit-identical for the same upstream
+        # reason — proper mixed mode awaits a CICEROSCM v2 patch).
+        loader_supplied_concentrations = (
+            scenarios is not None and not scenarios.empty
+            and not scenarios.filter(
+                scenario=scenario_name,
+                variable="Atmospheric Concentrations|*",
+            ).empty
+        )
+        if loader_supplied_concentrations:
+            LOGGER.info(
+                "CICEROSCMPY2 bundle mode: scenario %r supplies "
+                "Atmospheric Concentrations rows (protocol-strict ED "
+                "CO2-only); CICEROSCM v2 cannot run per-species mixed "
+                "mode, falling back to bundle's full all-GHG _em_ file "
+                "(matches Marit's published reference).",
+                scenario_name,
+            )
+
+        # ED-CO2-only scenarios share their bundle file with the bare
+        # variant (e.g. esm-ssp245 strips to ssp245_em_). For scenarios
+        # where the loader supplies mixed-mode inputs we want CICERO to
+        # use the bundle's full all-GHG file directly (per the
+        # CICEROSCM-v2 fallback above); for everything else we still
+        # prefer hybrid mode so the loader's ScmRun drives the run.
+        prefer_hybrid_for_co2_only = (
+            spec["mode"] == "ED-CO2-only"
+            and em_bundle_is_stripped
+            and not loader_supplied_concentrations
+        )
+
+        # For idealised scenarios, suppress hybrid mode entirely. The
+        # loader stub (or any user ScmRun) would splice onto
+        # historical_em inside _build_hybrid_emissions_data, exactly
+        # the historical-aerosol leak the em_fallback_chain above is
+        # designed to avoid. Use the PI-flat fallback chain directly.
         use_hybrid = (
             em_override is None
             and (em_bundle_match is None or prefer_hybrid_for_co2_only)
+            and not idealised
             and scenarios is not None
             and not scenarios.empty
             and scenario_name in set(scenarios["scenario"])
@@ -953,8 +1015,25 @@ def _build_scendata_list_bundle(  # noqa: PLR0912, PLR0915
             )
         else:
             em_path = em_bundle_match or _pick_bundle_file(
-                bundle_dir, [f"historical_em_{gases_ep}"]
+                bundle_dir, em_fallback_chain,
             )
+            if (
+                idealised
+                and em_bundle_match is None
+                and os.path.basename(em_path) != em_fallback_chain[0]
+            ):
+                LOGGER.warning(
+                    "CICEROSCMPY2 bundle mode: idealised scenario %r has "
+                    "no scenario-specific _em_ file and the preferred "
+                    "PI-flat fallback %s is missing from the bundle; "
+                    "using %s instead. Aerosol forcing will track "
+                    "historical anthropogenic precursors via "
+                    "calc_aerosol_forcing — the 'only CO2 varies' "
+                    "protocol invariant is violated.",
+                    scenario_name,
+                    em_fallback_chain[0],
+                    os.path.basename(em_path),
+                )
         conc_candidates = (
             [f"{b}_conc_{gases_ep}" for b in basenames]
             + [f"historical_conc_{gases_ep}"]
@@ -962,19 +1041,25 @@ def _build_scendata_list_bundle(  # noqa: PLR0912, PLR0915
         conc_path = cfg.get("concentrations_file") or _pick_bundle_file(
             bundle_dir, conc_candidates,
         )
+        # Solar / volcanic / LUC files in the bundle have per-scenario
+        # variants for the CMIP6 SSPs (ssp245, ...) and the CMIP7 scen7
+        # markers (scen7-H, ...), but not for the esm-* / esm-allGHG-*
+        # / scen7-*C variants. Apply the same prefix/suffix stripping
+        # we use for the _em_ / _conc_ files (step 5b) so e.g.
+        # esm-ssp245 picks up solar_RCMIP_ssp245_RCMIP3.txt rather than
+        # falling through to solar_RCMIP_historical_RCMIP3.txt — which
+        # forward-fills at 2023 and was the root cause of the post-2023
+        # +0.2-0.5 K bias against Marit on the esm-ssp* family.
+        forcing_basenames = [b for b in basenames]
         sun_path = cfg.get("rf_solar_file") or _pick_bundle_file(
             bundle_dir,
-            [
-                f"solar_RCMIP_{scenario_name}_RCMIP3.txt",
-                "solar_RCMIP_historical_RCMIP3.txt",
-            ],
+            [f"solar_RCMIP_{b}_RCMIP3.txt" for b in forcing_basenames]
+            + ["solar_RCMIP_historical_RCMIP3.txt"],
         )
         volc_path = cfg.get("rf_volc_file") or _pick_bundle_file(
             bundle_dir,
-            [
-                f"VOLC_RCMIP_{scenario_name}_RCMIP3.txt",
-                "VOLC_RCMIP_historical_RCMIP3.txt",
-            ],
+            [f"VOLC_RCMIP_{b}_RCMIP3.txt" for b in forcing_basenames]
+            + ["VOLC_RCMIP_historical_RCMIP3.txt"],
         )
         # When protocol_land_use_forcing == "constant_zero" (idealised
         # experiments + piControl variants), prefer the bundle's
@@ -983,17 +1068,20 @@ def _build_scendata_list_bundle(  # noqa: PLR0912, PLR0915
         # through 2022 then snaps back to 0 at 2023, producing both a
         # +0.2 W/m² warming jump (~15 mK uptick at 2024 in GSAT) and a
         # persistent ~0.12 K bias on the active emissions period.
+        luc_scenario_candidates = [
+            f"LUCalbedo_RCMIP_{b}_RCMIP3.txt" for b in forcing_basenames
+        ]
         if lu_zero:
-            luc_fallbacks = [
-                f"LUCalbedo_RCMIP_{scenario_name}_RCMIP3.txt",
-                "LUCalbedo_RCMIP_constant_zero_RCMIP3.txt",
-                "LUCalbedo_RCMIP_historical_RCMIP3.txt",
-            ]
+            luc_fallbacks = (
+                luc_scenario_candidates
+                + ["LUCalbedo_RCMIP_constant_zero_RCMIP3.txt",
+                   "LUCalbedo_RCMIP_historical_RCMIP3.txt"]
+            )
         else:
-            luc_fallbacks = [
-                f"LUCalbedo_RCMIP_{scenario_name}_RCMIP3.txt",
-                "LUCalbedo_RCMIP_historical_RCMIP3.txt",
-            ]
+            luc_fallbacks = (
+                luc_scenario_candidates
+                + ["LUCalbedo_RCMIP_historical_RCMIP3.txt"]
+            )
         luc_path = cfg.get("rf_luc_file") or _pick_bundle_file(
             bundle_dir, luc_fallbacks,
         )
