@@ -4,6 +4,7 @@ Adapters for different climate models
 
 from .base import _Adapter
 from .ciceroscm_adapter import CICEROSCM
+from .ciceroscm_py2_adapter import CICEROSCMPY2
 from .ciceroscm_py_adapter import CICEROSCMPY
 from .fair2_adapter import FAIR2
 from .fair_adapter import FAIR
@@ -12,6 +13,7 @@ from .magicc7 import MAGICC7
 _registered_adapters: list[type[_Adapter]] = [
     CICEROSCM,
     CICEROSCMPY,
+    CICEROSCMPY2,
     FAIR,
     FAIR2,
     MAGICC7,
