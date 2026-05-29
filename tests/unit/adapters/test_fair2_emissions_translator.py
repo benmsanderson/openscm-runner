@@ -245,6 +245,79 @@ def test_build_emissions_df_empty_inputs_returns_empty():
     assert df.empty
 
 
+def test_build_emissions_df_co2_only_zeros_non_co2_species(tmp_path):
+    """For idealised scenarios, non-CO2 species are zeroed across all years.
+
+    The RCMIP3 esm-flat*/bell*/1pctCO2*/abrupt-* protocols specify
+    constant pre-industrial non-CO2 forcing. The user's CSV omits
+    those species (only CO2 is provided), so without this filter the
+    bundle's historical non-CO2 emissions leak through (forward-filled
+    at 2023) and contaminate the run with ~2 W/m² of spurious
+    non-CO2 forcing by 2100.
+    """
+    bundle_path = _bundle_csv(tmp_path)
+    user = _user_scmrun()
+    df = build_emissions_df(
+        scmrun=user,
+        bundle_emissions_csv=bundle_path,
+        scenario_names=["ssp126", "ssp370"],
+        co2_only_scenarios=["ssp126"],
+    )
+
+    # CH4 zeroed for ssp126 (the idealised one), preserved for ssp370.
+    ch4_ssp126 = df[
+        (df["scenario"] == "ssp126") & (df["variable"] == "CH4")
+    ].iloc[0]
+    ch4_ssp370 = df[
+        (df["scenario"] == "ssp370") & (df["variable"] == "CH4")
+    ].iloc[0]
+    for year in ("1990", "2000", "2010"):
+        assert ch4_ssp126[year] == 0.0, (
+            f"CH4 should be zero in idealised ssp126 at {year}"
+        )
+    assert ch4_ssp370["2000"] == pytest.approx(320.0)
+
+    # CO2 NOT zeroed in either scenario (user-supplied + bundle overlap).
+    co2_ssp126 = df[
+        (df["scenario"] == "ssp126") & (df["variable"] == "CO2 FFI")
+    ].iloc[0]
+    assert co2_ssp126["2010"] == pytest.approx(35.0)
+
+
+def test_build_emissions_df_co2_only_recognises_magicc_dialect_too():
+    # If the spliced DataFrame happens to carry MAGICC-style CO2 names
+    # (e.g., when user data alone is present), the same is_co2 mask
+    # should still spare them.
+    user_df = pd.DataFrame(
+        [
+            {
+                "model": "iam", "scenario": "esm-flat10-zec", "region": "World",
+                "unit": "Gt CO2/yr",
+                "variable": "Emissions|CO2|MAGICC Fossil and Industrial",
+                "run_id": 0, 2000: 36.0, 2050: 0.0,
+            },
+            {
+                "model": "iam", "scenario": "esm-flat10-zec", "region": "World",
+                "unit": "Mt CH4/yr", "variable": "Emissions|CH4",
+                "run_id": 0, 2000: 300.0, 2050: 300.0,
+            },
+        ]
+    )
+    user = scmdata.ScmRun(user_df)
+    df = build_emissions_df(
+        scmrun=user, bundle_emissions_csv=None,
+        scenario_names=["esm-flat10-zec"],
+        co2_only_scenarios=["esm-flat10-zec"],
+    )
+    co2 = df[df["variable"].str.contains("CO2")]
+    ch4 = df[df["variable"].str.endswith("CH4")]
+    assert not co2.empty
+    assert co2.iloc[0]["2000"] == pytest.approx(36.0)  # CO2 untouched
+    assert not ch4.empty
+    assert ch4.iloc[0]["2000"] == 0.0  # CH4 zeroed
+    assert ch4.iloc[0]["2050"] == 0.0
+
+
 def test_openscm_to_fair2_species_covers_documented_map():
     """The exported map and the lookup helper agree."""
     for suffix in OPENSCM_TO_FAIR2_SPECIES:

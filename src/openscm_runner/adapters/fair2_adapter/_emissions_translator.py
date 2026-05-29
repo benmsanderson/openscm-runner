@@ -381,6 +381,7 @@ def build_emissions_df(
     scmrun,
     bundle_emissions_csv,
     scenario_names: Iterable[str],
+    co2_only_scenarios: Iterable[str] = (),
 ) -> pd.DataFrame:
     """
     Build the FaIR 2.x-shaped emissions DataFrame.
@@ -402,6 +403,14 @@ def build_emissions_df(
         ``historical_emissions_1750-2023_cmip7.csv``).
     scenario_names : iterable of str
         FaIR scenario labels to populate.
+    co2_only_scenarios : iterable of str
+        Scenarios whose non-CO2 species should be zeroed out across all
+        years after the splice. The RCMIP3 idealised CO2 experiments
+        (``esm-flat*``, ``esm-bell*``, ``1pctCO2*``, ``abrupt-*``) only
+        supply CO2 emissions in the protocol CSV, expecting non-CO2
+        forcings to stay at pre-industrial. Without this list, the
+        bundle's historical non-CO2 values leak through (forward-filled
+        at 2023 by the splice) and contaminate the diagnostics.
 
     Returns
     -------
@@ -425,6 +434,24 @@ def build_emissions_df(
         return pd.DataFrame()
 
     spliced = _splice_bundle_with_user(bundle_df, user_df, scenario_names)
+
+    co2_only_set = set(co2_only_scenarios)
+    if co2_only_set:
+        year_cols = [c for c in spliced.columns if isinstance(c, int)]
+        # CO2 in the spliced DataFrame appears under either the bundle's
+        # FaIR-native names ("CO2 FFI", "CO2 AFOLU") or the user-side
+        # MAGICC names ("Emissions|CO2|MAGICC Fossil and Industrial").
+        # Match both so the zero-out doesn't accidentally zero CO2.
+        variable = spliced["variable"].astype(str)
+        is_co2 = (
+            variable.str.startswith("Emissions|CO2")
+            | variable.str.startswith("CO2 ")
+            | (variable == "CO2")
+        )
+        mask = spliced["scenario"].isin(co2_only_set) & ~is_co2
+        if mask.any() and year_cols:
+            spliced.loc[mask, year_cols] = 0.0
+
     # FaIR 2.x's fill_from_pandas runs `df.columns.str.lower()` on the
     # DataFrame, which silently replaces non-string column labels with
     # NaN under a mixed-type Index (str metadata + int years). Convert

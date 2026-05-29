@@ -263,3 +263,183 @@ def test_fair2_conc_driven_requires_bundle_dir(tmp_path):
             output_variables=("Surface Air Temperature Change",),
             output_config=None,
         )
+
+
+def test_is_idealised_matches_ciceroscmpy2_rule():
+    # Same rule in both adapters: idealised scenarios get zero natural
+    # forcing per the RCMIP3 protocol. Keep the two helpers in sync
+    # so a mixed-model sweep treats the same set consistently.
+    from openscm_runner.adapters.fair2_adapter.fair2_adapter import (
+        _is_idealised as fair_is_idealised,
+    )
+    from openscm_runner.adapters.ciceroscm_py2_adapter.ciceroscmpy2_adapter import (
+        _is_idealised as cscm_is_idealised,
+    )
+    cases = (
+        "esm-flat10", "esm-flat10-zec", "esm-flat20-rev", "esm-flat7.5-cdr",
+        "esm-bell-1000PgC", "esm-pi-CO2pulse", "esm-pi-cdr-pulse",
+        "1pctCO2", "1pctCO2-cdr", "abrupt-4xCO2",
+        "ssp245", "scen7-VL", "historical",
+        "esm-ssp245", "esm-allGHG-ssp370-lowCH4", "methanemip-TM-allGHG",
+    )
+    for s in cases:
+        assert fair_is_idealised(s) == cscm_is_idealised(s), (
+            f"FaIRv2 and CICEROSCMPY2 disagree on _is_idealised({s!r})"
+        )
+
+
+def test_resolve_protocol_flags_reads_metadata_cols_when_present():
+    # When the input ScmRun carries the loader's protocol metadata, the
+    # resolver returns the per-scenario (natural_off, land_use_zero)
+    # flags directly from those cols.
+    import pandas as pd
+    from scmdata import ScmRun
+
+    from openscm_runner.adapters.fair2_adapter.fair2_adapter import (
+        _resolve_protocol_flags,
+    )
+
+    df = pd.DataFrame(
+        [
+            # CD real-world (natural=on, lu=historical) -> both False
+            {"model": "m", "scenario": "ssp245", "region": "World",
+             "variable": "Emissions|CO2|MAGICC Fossil and Industrial",
+             "unit": "Mt CO2/yr",
+             "protocol_natural_forcing": "on",
+             "protocol_land_use_forcing": "historical",
+             "2020": 1.0},
+            # CD idealised (natural=off, lu=constant_zero) -> both True
+            {"model": "m", "scenario": "1pctCO2", "region": "World",
+             "variable": "Emissions|CO2|MAGICC Fossil and Industrial",
+             "unit": "Mt CO2/yr",
+             "protocol_natural_forcing": "off",
+             "protocol_land_use_forcing": "constant_zero",
+             "2020": 0.0},
+        ]
+    )
+    run = ScmRun(df)
+    flags = _resolve_protocol_flags(run, ["ssp245", "1pctCO2"])
+    assert flags == {"ssp245": (False, False), "1pctCO2": (True, True)}
+
+
+def test_resolve_protocol_flags_falls_back_to_is_idealised_without_metadata():
+    # When the ScmRun doesn't carry the metadata cols (e.g. user
+    # constructed it directly without going through load_rcmip3_*),
+    # the resolver falls back to the name-pattern _is_idealised helper
+    # and ties natural/land_use together.
+    import pandas as pd
+    from scmdata import ScmRun
+
+    from openscm_runner.adapters.fair2_adapter.fair2_adapter import (
+        _resolve_protocol_flags,
+    )
+
+    df = pd.DataFrame(
+        [
+            {"model": "m", "scenario": "ssp245", "region": "World",
+             "variable": "Emissions|CO2|MAGICC Fossil and Industrial",
+             "unit": "Mt CO2/yr", "2020": 1.0},
+            {"model": "m", "scenario": "abrupt-4xCO2", "region": "World",
+             "variable": "Emissions|CO2|MAGICC Fossil and Industrial",
+             "unit": "Mt CO2/yr", "2020": 1.0},
+        ]
+    )
+    run = ScmRun(df)
+    flags = _resolve_protocol_flags(run, ["ssp245", "abrupt-4xCO2"])
+    assert flags["ssp245"] == (False, False)
+    # abrupt-* matches _is_idealised so both flags fire together.
+    assert flags["abrupt-4xCO2"] == (True, True)
+
+
+def test_resolve_protocol_flags_falls_back_for_scenarios_not_in_run():
+    # Mixed case: meta cols are present in general, but a requested
+    # scenario name isn't covered by any row (e.g. a bundle-only
+    # scenario that the adapter knows about but the ScmRun excludes).
+    # The resolver should fall back to name-pattern matching for the
+    # missing scenario rather than silently returning (False, False).
+    import pandas as pd
+    from scmdata import ScmRun
+
+    from openscm_runner.adapters.fair2_adapter.fair2_adapter import (
+        _resolve_protocol_flags,
+    )
+
+    df = pd.DataFrame(
+        [
+            {"model": "m", "scenario": "ssp245", "region": "World",
+             "variable": "Emissions|CO2|MAGICC Fossil and Industrial",
+             "unit": "Mt CO2/yr",
+             "protocol_natural_forcing": "on",
+             "protocol_land_use_forcing": "historical",
+             "2020": 1.0},
+        ]
+    )
+    run = ScmRun(df)
+    flags = _resolve_protocol_flags(run, ["ssp245", "esm-flat10"])
+    # ssp245 covered by metadata -> reads directly.
+    assert flags["ssp245"] == (False, False)
+    # esm-flat10 not in the run -> _is_idealised fallback.
+    assert flags["esm-flat10"] == (True, True)
+
+
+def test_resolve_protocol_flags_handles_none_scenario_run():
+    # When no ScmRun is supplied at all (e.g. concentration-only run
+    # paths that don't pass scenario_run), the resolver should still
+    # produce the right flags from name-pattern matching alone.
+    from openscm_runner.adapters.fair2_adapter.fair2_adapter import (
+        _resolve_protocol_flags,
+    )
+    flags = _resolve_protocol_flags(
+        None, ["ssp245", "esm-flat10", "1pctCO2"],
+    )
+    assert flags["ssp245"] == (False, False)
+    assert flags["esm-flat10"] == (True, True)
+    assert flags["1pctCO2"] == (True, True)
+
+
+def test_resolve_protocol_flags_handles_independent_natural_and_land_use():
+    # The two flags can move independently when the metadata says so.
+    # No scenario in the current registry actually does this, but the
+    # resolver must support it for future protocol additions.
+    import pandas as pd
+    from scmdata import ScmRun
+
+    from openscm_runner.adapters.fair2_adapter.fair2_adapter import (
+        _resolve_protocol_flags,
+    )
+
+    df = pd.DataFrame(
+        [
+            {"model": "m", "scenario": "weird-scen", "region": "World",
+             "variable": "Emissions|CO2|MAGICC Fossil and Industrial",
+             "unit": "Mt CO2/yr",
+             "protocol_natural_forcing": "on",
+             "protocol_land_use_forcing": "constant_zero",
+             "2020": 1.0},
+        ]
+    )
+    run = ScmRun(df)
+    flags = _resolve_protocol_flags(run, ["weird-scen"])
+    assert flags["weird-scen"] == (False, True)
+
+
+def test_resolve_protocol_flags_end_to_end_with_loader():
+    # Smoke test using the actual loader output (no real CSVs needed —
+    # bundle-only stubs carry metadata too) to confirm the resolver
+    # works end-to-end with the load_rcmip3_emissions return shape.
+    from openscm_runner.adapters.fair2_adapter.fair2_adapter import (
+        _resolve_protocol_flags,
+    )
+    from openscm_runner.scenarios import load_rcmip3_emissions
+
+    run = load_rcmip3_emissions(
+        ["1pctCO2", "esm-1pct-brch-1000PgC", "esm-allGHG-piControl"],
+        download_if_missing=False,
+    )
+    flags = _resolve_protocol_flags(
+        run, ["1pctCO2", "esm-1pct-brch-1000PgC", "esm-allGHG-piControl"],
+    )
+    # All three are idealised: natural=off, LU=constant_zero.
+    assert flags["1pctCO2"] == (True, True)
+    assert flags["esm-1pct-brch-1000PgC"] == (True, True)
+    assert flags["esm-allGHG-piControl"] == (True, True)

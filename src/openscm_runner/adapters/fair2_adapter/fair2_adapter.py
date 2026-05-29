@@ -52,6 +52,7 @@ architecture notes.
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterable, Sequence
 from typing import Any
 
 import pandas as pd
@@ -324,15 +325,27 @@ def _run_translated_cfgs(  # noqa: PLR0912, PLR0915
 
     if calibration is not None:
         bundle_emissions_csv = calibration.file("historical_emissions")
+        flags = _resolve_protocol_flags(scenario_run, scenario_names)
+        natural_off = tuple(s for s, (nat, _) in flags.items() if nat)
+        land_use_zero = tuple(s for s, (_, lu) in flags.items() if lu)
         if bundle_emissions_csv is not None or (
             scenario_run is not None and not scenario_run.empty
         ):
+            # CO2-only masking now lives in the loader (see
+            # openscm_runner.scenarios.rcmip3._apply_co2_only_mask) and
+            # the ED-CO2-only flag rides on the protocol_mode meta col;
+            # build_emissions_df no longer needs the co2_only_scenarios
+            # kwarg.
             emissions_df = build_emissions_df(
-                scenario_run, bundle_emissions_csv, scenario_names
+                scenario_run, bundle_emissions_csv, scenario_names,
             )
             if not emissions_df.empty:
                 f.fill_from_pandas(mode="emissions", df=emissions_df)
-        _fill_natural_forcings(f, calibration)
+        _fill_natural_forcings(
+            f, calibration,
+            zero_natural_scenarios=natural_off,
+            zero_land_use_scenarios=land_use_zero,
+        )
     else:
         # No bundle: fall back to FaIR's RCMIP defaults. Known to
         # break on fair 2.2.4 for HFC-4310mee; recommend bundle path.
@@ -585,11 +598,18 @@ def _run_one_calibration(  # noqa: PLR0912, PLR0913, PLR0915
             calibration.FILES["historical_emissions"],
         )
 
+    flags = _resolve_protocol_flags(scenario_run, scenario_names)
+    natural_off = tuple(s for s, (nat, _) in flags.items() if nat)
+    land_use_zero = tuple(s for s, (_, lu) in flags.items() if lu)
+
     if bundle_emissions_csv is not None or (
         scenario_run is not None and not scenario_run.empty
     ):
+        # CO2-only masking now lives in the loader (see
+        # openscm_runner.scenarios.rcmip3._apply_co2_only_mask) — the
+        # adapter no longer needs to ask build_emissions_df for it.
         emissions_df = build_emissions_df(
-            scenario_run, bundle_emissions_csv, scenario_names
+            scenario_run, bundle_emissions_csv, scenario_names,
         )
         if not emissions_df.empty:
             f.fill_from_pandas(mode="emissions", df=emissions_df)
@@ -603,9 +623,17 @@ def _run_one_calibration(  # noqa: PLR0912, PLR0913, PLR0915
     if use_conc and conc_df is not None and not conc_df.empty:
         f.fill_from_pandas(mode="concentration", df=conc_df)
 
-    # Natural (solar / volcanic) forcings live in separate CSVs in the
-    # bundle and use a forcing-mode input rather than emissions.
-    _fill_natural_forcings(f, calibration)
+    # Natural (solar/volcanic) and land-use (Land use, Irrigation)
+    # forcings live in separate CSVs in the bundle and use forcing-mode
+    # inputs rather than emissions. Per-scenario suppression is now
+    # driven by the loader's protocol_natural_forcing /
+    # protocol_land_use_forcing meta cols (see _resolve_protocol_flags
+    # for the fallback when those cols are missing).
+    _fill_natural_forcings(
+        f, calibration,
+        zero_natural_scenarios=natural_off,
+        zero_land_use_scenarios=land_use_zero,
+    )
 
     f.run(progress=False, suppress_warnings=True)
 
@@ -629,7 +657,76 @@ def _run_one_calibration(  # noqa: PLR0912, PLR0913, PLR0915
 _DEFAULT_LAND_USE_SCENARIO = "M"
 
 
-def _fill_natural_forcings(f, calibration: NativeFairCalibration) -> None:
+def _is_idealised(scenario_name: str) -> bool:
+    """True for RCMIP3 idealised experiments that need zero natural forcing.
+
+    Covers ``esm-flat*`` constant-emissions, ``esm-bell*`` and
+    ``esm-pi-*`` impulse-response, ``1pctCO2*`` and ``abrupt-*``
+    concentration-driven idealised runs.
+
+    Legacy name-pattern fallback used by :func:`_resolve_protocol_flags`
+    when the input ScmRun was constructed outside
+    :func:`openscm_runner.scenarios.load_rcmip3_emissions` and therefore
+    lacks the ``protocol_natural_forcing`` / ``protocol_land_use_forcing``
+    meta columns. New code should prefer reading those columns directly.
+    """
+    s = scenario_name.lower()
+    return (
+        s.startswith("esm-flat") or s.startswith("esm-bell")
+        or s.startswith("esm-pi-") or s.startswith("esm-1pct")
+        or s.startswith("1pctco2") or s.startswith("abrupt")
+    )
+
+
+def _resolve_protocol_flags(
+    scenario_run: ScmRun | None,
+    scenario_names: Sequence[str],
+) -> dict[str, tuple[bool, bool]]:
+    """Return ``{scenario: (natural_forcing_off, land_use_zero)}`` per scenario.
+
+    Reads ``protocol_natural_forcing`` and ``protocol_land_use_forcing``
+    from the input ScmRun's meta columns when available; falls back to
+    the legacy :func:`_is_idealised` name-pattern check for scenarios
+    not covered by the meta (or for callers that constructed the ScmRun
+    outside of ``load_rcmip3_*``). When the fallback fires, both flags
+    move in lockstep — the legacy helper has no separate signal for
+    land-use vs. natural forcing.
+    """
+    meta = getattr(scenario_run, "meta", None)
+    have_meta = (
+        meta is not None
+        and "protocol_natural_forcing" in meta.columns
+        and "protocol_land_use_forcing" in meta.columns
+    )
+    meta_by_scen: dict[str, tuple[bool, bool]] = {}
+    if have_meta:
+        grouped = meta.groupby("scenario")[
+            ["protocol_natural_forcing", "protocol_land_use_forcing"]
+        ]
+        for scen_name, group in grouped:
+            natural_off = set(group["protocol_natural_forcing"]) == {"off"}
+            land_use_zero = (
+                set(group["protocol_land_use_forcing"]) == {"constant_zero"}
+            )
+            meta_by_scen[str(scen_name)] = (natural_off, land_use_zero)
+
+    result: dict[str, tuple[bool, bool]] = {}
+    for name in scenario_names:
+        if name in meta_by_scen:
+            result[name] = meta_by_scen[name]
+        else:
+            ideal = _is_idealised(name)
+            result[name] = (ideal, ideal)
+    return result
+
+
+def _fill_natural_forcings(
+    f,
+    calibration: NativeFairCalibration,
+    *,
+    zero_natural_scenarios: Iterable[str] = (),
+    zero_land_use_scenarios: Iterable[str] = (),
+) -> None:
     """
     Populate FaIR's forcing arrays for the bundle's forcing-input species.
 
@@ -646,6 +743,16 @@ def _fill_natural_forcings(f, calibration: NativeFairCalibration) -> None:
     (VL, LN, L, ML, M, H, HL) and we pick ``_DEFAULT_LAND_USE_SCENARIO``
     (currently ``"M"``) with a warning.
 
+    Two independent suppression sets:
+
+    * ``zero_natural_scenarios`` zeros Solar and Volcanic forcing for
+      the listed scenarios (RCMIP3 ``protocol_natural_forcing == "off"``:
+      idealised experiments and piControl).
+    * ``zero_land_use_scenarios`` zeros Land use and Irrigation for
+      the listed scenarios (RCMIP3 ``protocol_land_use_forcing ==
+      "constant_zero"``: same set in the current registry, but kept
+      separate so a future scenario could combine on/off pairings).
+
     Missing CSVs leave the arrays at their default (zero) baseline.
     """
     import numpy as np
@@ -656,11 +763,23 @@ def _fill_natural_forcings(f, calibration: NativeFairCalibration) -> None:
     n_scen = len(f.scenarios)
     n_cfg = len(f.configs)
 
-    def _write(species_name, series):
+    natural_mask = np.array(
+        [s in zero_natural_scenarios for s in f.scenarios], dtype=bool,
+    )
+    land_use_mask = np.array(
+        [s in zero_land_use_scenarios for s in f.scenarios], dtype=bool,
+    )
+
+    def _write(species_name, series, suppress_mask):
         # Reindex onto FaIR's timebounds and fill missing as zero.
         series = series.reindex(f.timebounds).fillna(0.0)
+        per_scen = np.broadcast_to(
+            series.values[:, None], (n_t, n_scen)
+        ).copy()
+        if suppress_mask.any():
+            per_scen[:, suppress_mask] = 0.0
         broadcasted = np.broadcast_to(
-            series.values[:, None, None], (n_t, n_scen, n_cfg)
+            per_scen[:, :, None], (n_t, n_scen, n_cfg)
         )
         fill(f.forcing, broadcasted, specie=species_name)
 
@@ -695,7 +814,7 @@ def _fill_natural_forcings(f, calibration: NativeFairCalibration) -> None:
                 species_name,
             )
             continue
-        _write(species_name, df.set_index(year_col)[value_col])
+        _write(species_name, df.set_index(year_col)[value_col], natural_mask)
 
     # Multi-column per-scenario CSVs (Land use, Irrigation). First
     # column is the year index (unnamed); remaining columns are
@@ -736,4 +855,4 @@ def _fill_natural_forcings(f, calibration: NativeFairCalibration) -> None:
                 bundle_key,
                 species_name,
             )
-        _write(species_name, df[choice])
+        _write(species_name, df[choice], land_use_mask)
