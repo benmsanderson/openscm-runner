@@ -8,12 +8,7 @@ ssp370-lowNTCF-gidden, ssp434, ssp460, ssp534-over, ssp585) against
 prints a per-scenario 2100 GSAT / CO2 / ERF summary.
 
 Results are kept in memory: a 20-member sweep is well under 1 MB
-total and a 1000-member sweep is still only ~50 MB. Streaming output
-to per-scenario netCDF is intentionally not wired in here because the
-shipped ``openscm_runner.output.NetCDFChunkWriter`` triggers a
-pandas 3.0 / scmdata 0.18 incompatibility in
-``scmdata.ScmRun.to_nc`` (Series positional indexing); add it back
-once scmdata is patched or pandas is pinned below 3.0.
+total and a 1000-member sweep is still only ~50 MB.
 
 Usage
 -----
@@ -42,19 +37,10 @@ import time
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
+import scmdata
 
-# scmdata 0.18.0 pre-dates pandas 3.0's default StringDtype inference:
-# its groupby/xarray code calls ``numpy.issubdtype`` on column dtypes,
-# which raises on the new dtype. Disabling future-string inference for
-# this process restores object-dtype string columns so the run
-# completes. Remove once scmdata supports StringDtype.
-pd.set_option("future.infer_string", False)
-
-import scmdata  # noqa: E402  (must follow the pandas option flip above)
-
-import openscm_runner.run  # noqa: E402
-from openscm_runner.adapters import FAIR2  # noqa: E402
+import openscm_runner.run
+from openscm_runner.adapters import FAIR2
 
 
 _SUMMARY_VARS = (

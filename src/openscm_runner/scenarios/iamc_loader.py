@@ -89,32 +89,36 @@ _CO2_SECTOR_RENAMES = {
 
 # The set of canonical variable names openscm-runner adapters know how
 # to drive. Anything outside this set is dropped during filtering.
+# Emissions go through the per-species harmonisation in
+# _canonicalise_variable; Atmospheric Concentrations follow the same
+# parent-path stripping so any source file using
+# ``Atmospheric Concentrations|F-Gases|HFC|HFC125`` ends up as the
+# canonical ``Atmospheric Concentrations|HFC125``. Aerosols and most
+# reactive species have no concentration entry by design (their
+# protocol input is emissions-only).
+_EMISSIONS_SPECIES = (
+    "CO2|MAGICC Fossil and Industrial", "CO2|MAGICC AFOLU",
+    "CH4", "N2O",
+    "HFC125", "HFC134a", "HFC143a", "HFC227ea", "HFC23",
+    "HFC245fa", "HFC32", "HFC4310mee",
+    "CF4", "C2F6", "C6F14", "SF6",
+    "BC", "OC", "Sulfur", "NOx", "NH3", "VOC", "CO",
+)
+_CONCENTRATION_SPECIES = (
+    "CO2", "CH4", "N2O",
+    "HFC125", "HFC134a", "HFC143a", "HFC227ea", "HFC23",
+    "HFC245fa", "HFC32", "HFC4310mee",
+    "HFC152a", "HFC236fa", "HFC365mfc",
+    "CF4", "C2F6", "C3F8", "C4F10", "C5F12", "C6F14",
+    "C7F16", "C8F18", "cC4F8", "SF6", "SO2F2", "NF3",
+    "CFC11", "CFC12", "CFC113", "CFC114", "CFC115",
+    "HCFC22", "HCFC141b", "HCFC142b",
+    "CCl4", "CH3CCl3", "CH3Cl", "CH3Br", "CH2Cl2", "CHCl3",
+    "Halon1202", "Halon1211", "Halon1301", "Halon2402",
+)
 CANONICAL_VARIABLES: frozenset[str] = frozenset(
-    {
-        "Emissions|CO2|MAGICC Fossil and Industrial",
-        "Emissions|CO2|MAGICC AFOLU",
-        "Emissions|CH4",
-        "Emissions|N2O",
-        "Emissions|HFC125",
-        "Emissions|HFC134a",
-        "Emissions|HFC143a",
-        "Emissions|HFC227ea",
-        "Emissions|HFC23",
-        "Emissions|HFC245fa",
-        "Emissions|HFC32",
-        "Emissions|HFC4310mee",
-        "Emissions|CF4",
-        "Emissions|C2F6",
-        "Emissions|C6F14",
-        "Emissions|SF6",
-        "Emissions|BC",
-        "Emissions|OC",
-        "Emissions|Sulfur",
-        "Emissions|NOx",
-        "Emissions|NH3",
-        "Emissions|VOC",
-        "Emissions|CO",
-    }
+    [f"Emissions|{s}" for s in _EMISSIONS_SPECIES]
+    + [f"Atmospheric Concentrations|{s}" for s in _CONCENTRATION_SPECIES]
 )
 
 _REQUIRED_COLUMNS = frozenset({"model", "scenario", "region", "variable", "unit"})
@@ -220,13 +224,22 @@ def _canonicalise_unit(u: str) -> str:
 
 
 def _canonicalise_variable(name: str) -> str:
-    if not isinstance(name, str) or not name.startswith("Emissions|"):
+    if not isinstance(name, str):
         return name
-    body = name[len("Emissions|") :]
+    for prefix in ("Emissions|", "Atmospheric Concentrations|"):
+        if name.startswith(prefix):
+            return _canonicalise_with_prefix(name, prefix)
+    return name
 
-    # CO2 sector splits handled separately; never strip parents from these.
-    if body.startswith("CO2|"):
-        sector = body[len("CO2|") :]
+
+def _canonicalise_with_prefix(name: str, prefix: str) -> str:
+    body = name[len(prefix):]
+
+    # CO2 sector splits only apply to emissions; the concentrations
+    # source publishes a single ``Atmospheric Concentrations|CO2`` row,
+    # never split by sector, so the CO2| branch is emissions-only.
+    if prefix == "Emissions|" and body.startswith("CO2|"):
+        sector = body[len("CO2|"):]
         mapped = _CO2_SECTOR_RENAMES.get(sector)
         if mapped is not None:
             return f"Emissions|CO2|{mapped}"
@@ -234,11 +247,11 @@ def _canonicalise_variable(name: str) -> str:
 
     for parent in _PARENT_PATHS:
         if body.startswith(parent):
-            body = body[len(parent) :]
+            body = body[len(parent):]
             break
 
     body = _SPECIES_RENAMES.get(body, body)
-    return f"Emissions|{body}"
+    return f"{prefix}{body}"
 
 
 def _filter(
