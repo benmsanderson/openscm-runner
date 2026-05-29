@@ -331,13 +331,31 @@ def _run_translated_cfgs(  # noqa: PLR0912, PLR0915
         if bundle_emissions_csv is not None or (
             scenario_run is not None and not scenario_run.empty
         ):
-            # CO2-only masking now lives in the loader (see
-            # openscm_runner.scenarios.rcmip3._apply_co2_only_mask) and
-            # the ED-CO2-only flag rides on the protocol_mode meta col;
-            # build_emissions_df no longer needs the co2_only_scenarios
-            # kwarg.
+            # Mixed-mode ScmRuns carry Atmospheric Concentrations rows
+            # alongside Emissions; the conc path handles those, so
+            # filter to Emissions|* here to avoid unit-conversion
+            # warnings in the emissions translator.
+            emissions_run = (
+                scenario_run.filter(variable="Emissions|*")
+                if scenario_run is not None and not scenario_run.empty
+                else scenario_run
+            )
+            # Genuinely idealised scenarios (natural_forcing=off AND
+            # land_use_forcing=constant_zero — esm-flat*, esm-bell-*,
+            # esm-pi-*, 1pctCO2*, abrupt-*) get non-CO2 zeroed across
+            # all years after the splice. Without this, the bundle's
+            # historical_emissions leaks through for species the
+            # loader doesn't supply (the protocol's flat/bell/pi/etc.
+            # CSV rows are CO2-only by construction) and FaIR runs
+            # with full historical CH4/Sulfur/NOx — the same
+            # "historical leak in idealised" bug CICERO's issue-5
+            # fix addresses on the other adapter.
+            idealised_scenarios = tuple(
+                s for s, (nat, lu) in flags.items() if nat and lu
+            )
             emissions_df = build_emissions_df(
-                scenario_run, bundle_emissions_csv, scenario_names,
+                emissions_run, bundle_emissions_csv, scenario_names,
+                co2_only_scenarios=idealised_scenarios,
             )
             if not emissions_df.empty:
                 f.fill_from_pandas(mode="emissions", df=emissions_df)
@@ -484,7 +502,90 @@ def _run_one_calibration(  # noqa: PLR0912, PLR0913, PLR0915
         first = scenario_names[0].lower()
         use_conc = not first.startswith(("esm-", "esm_", "methanemip"))
 
-    if use_conc:
+    # Mixed-mode (protocol-strict ED CO2-only) detection: the loader's
+    # _load_mixed_mode_scenario returns a ScmRun containing both
+    # Emissions|CO2|* and Atmospheric Concentrations|* (non-CO2).
+    #
+    # FaIR's input_mode is a per-species flag that applies to ALL
+    # scenarios in the FAIR instance, so mixed mode is only safe when
+    # EVERY scenario in this batch supplies the same set of
+    # Atmospheric Concentrations|* species. If the batch mixes
+    # mixed-mode scenarios (esm-ssp245) with non-mixed (esm-flat10),
+    # we'd flip species to conc-mode but fill_from_pandas would crash
+    # on the missing rows for non-mixed scenarios. In that case we
+    # fall back to the bundle-based conc_df path (when available) or
+    # plain emissions-driven.
+    if scenario_run is not None and not scenario_run.empty:
+        scenarios_in_run = set(scenario_run["scenario"].unique())
+        conc_run_for_batch = scenario_run.filter(
+            variable="Atmospheric Concentrations|*",
+        )
+        conc_scenarios_in_run = (
+            set(conc_run_for_batch["scenario"].unique())
+            if not conc_run_for_batch.empty else set()
+        )
+        all_batch_scenarios_supply_conc = (
+            len(conc_scenarios_in_run) > 0
+            and conc_scenarios_in_run == scenarios_in_run
+        )
+    else:
+        all_batch_scenarios_supply_conc = False
+
+    if all_batch_scenarios_supply_conc:
+        from ._concentrations_translator import (
+            build_concentrations_df_from_scmrun,
+        )
+
+        conc_df = build_concentrations_df_from_scmrun(
+            scenario_run,
+            fair_species=species,
+            nystart=start_year, nyend=end_year,
+        )
+        if conc_df.empty:
+            LOGGER.warning(
+                "FaIRv2 mixed mode: loader provided Atmospheric "
+                "Concentrations rows but none mapped to fair_species; "
+                "falling back to emissions-driven.",
+            )
+        else:
+            # Only flip species that have rows for EVERY scenario in
+            # the batch (defensive: fill_from_pandas can't tolerate a
+            # missing (species, scenario) cell once input_mode is
+            # flipped to concentration).
+            scenarios_in_run = set(scenario_run["scenario"].unique())
+            species_per_scenario = (
+                conc_df.groupby("scenario")["variable"]
+                .agg(set).to_dict()
+            )
+            common_conc_species = set.intersection(
+                *(species_per_scenario[s] for s in scenarios_in_run
+                  if s in species_per_scenario)
+            ) if species_per_scenario else set()
+            if not common_conc_species:
+                LOGGER.warning(
+                    "FaIRv2 mixed mode: no concentration species "
+                    "shared by all scenarios in the batch; falling "
+                    "back to emissions-driven.",
+                )
+                conc_df = None
+            else:
+                conc_df = conc_df[conc_df["variable"].isin(common_conc_species)]
+                use_conc = True
+                for sp_name in common_conc_species:
+                    if sp_name in properties:
+                        properties[sp_name] = {
+                            **properties[sp_name],
+                            "input_mode": "concentration",
+                        }
+                LOGGER.info(
+                    "FaIRv2 mixed mode (protocol-strict ED CO2-only): "
+                    "consuming %d concentration species from the "
+                    "loader's ScmRun (CO2 stays emissions-driven). %s",
+                    len(common_conc_species),
+                    "Bundle-based conc_df path skipped." if conc_bundle_dir
+                    else "",
+                )
+    elif use_conc:
         # `conc_bundle_dir is not None` is guaranteed by the cfg-level
         # validation in _run_native_cfgs (raised before we get here).
         from ._concentrations_translator import build_concentrations_df
@@ -605,11 +706,27 @@ def _run_one_calibration(  # noqa: PLR0912, PLR0913, PLR0915
     if bundle_emissions_csv is not None or (
         scenario_run is not None and not scenario_run.empty
     ):
-        # CO2-only masking now lives in the loader (see
-        # openscm_runner.scenarios.rcmip3._apply_co2_only_mask) — the
-        # adapter no longer needs to ask build_emissions_df for it.
+        # Mixed-mode ScmRuns include Atmospheric Concentrations rows
+        # (handled separately via the conc_df path above). Filter them
+        # out before passing to build_emissions_df, otherwise the
+        # emissions translator tries to coerce ppb/ppt -> kt/yr and
+        # logs a unit-conversion warning per species.
+        emissions_run = (
+            scenario_run.filter(variable="Emissions|*")
+            if scenario_run is not None and not scenario_run.empty
+            else scenario_run
+        )
+        # Genuinely idealised scenarios (natural=off AND LU=constant_zero)
+        # need their non-CO2 zeroed post-splice so the bundle's
+        # historical_emissions don't leak through for species the
+        # loader doesn't supply. See the parallel comment in
+        # _run_translated_cfgs above and CICERO's issue-5 fix.
+        idealised_scenarios = tuple(
+            s for s, (nat, lu) in flags.items() if nat and lu
+        )
         emissions_df = build_emissions_df(
-            scenario_run, bundle_emissions_csv, scenario_names,
+            emissions_run, bundle_emissions_csv, scenario_names,
+            co2_only_scenarios=idealised_scenarios,
         )
         if not emissions_df.empty:
             f.fill_from_pandas(mode="emissions", df=emissions_df)

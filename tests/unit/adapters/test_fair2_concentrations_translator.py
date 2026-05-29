@@ -168,3 +168,86 @@ def test_build_concentrations_df_empty_when_no_files(tmp_path):
         fair_species=fair_species,
     )
     assert df.empty
+
+
+def test_build_concentrations_df_from_scmrun_extracts_conc_and_renames():
+    # Mixed-mode ScmRun (per loader's _load_mixed_mode_scenario): both
+    # Emissions and Atmospheric Concentrations rows. The helper should
+    # extract the conc half, strip the prefix, map species via
+    # CICERO_TO_FAIR2_SPECIES, and shape for fill_from_pandas.
+    import pandas as pd
+    from scmdata import ScmRun
+
+    from openscm_runner.adapters.fair2_adapter._concentrations_translator import (
+        build_concentrations_df_from_scmrun,
+    )
+
+    df = pd.DataFrame([
+        # Emissions row — must be dropped
+        {"model": "m", "scenario": "esm-ssp245", "region": "World",
+         "variable": "Emissions|CO2|MAGICC Fossil and Industrial",
+         "unit": "Mt CO2/yr", "2020": 35000.0, "2050": 30000.0},
+        # Concentration rows — must be kept, prefix stripped, species
+        # name renamed via CICERO_TO_FAIR2_SPECIES.
+        {"model": "m", "scenario": "esm-ssp245", "region": "World",
+         "variable": "Atmospheric Concentrations|CH4",
+         "unit": "ppb", "2020": 1900.0, "2050": 1800.0},
+        {"model": "m", "scenario": "esm-ssp245", "region": "World",
+         "variable": "Atmospheric Concentrations|HFC125",
+         "unit": "ppt", "2020": 50.0, "2050": 70.0},
+    ])
+    run = ScmRun(df)
+    out = build_concentrations_df_from_scmrun(
+        run, fair_species={"CO2", "CH4", "HFC-125"},
+        nystart=2020, nyend=2050,
+    )
+    assert sorted(out["variable"].tolist()) == ["CH4", "HFC-125"]
+    by_var = out.set_index("variable")
+    assert by_var.loc["CH4", "2020"] == 1900.0
+    assert by_var.loc["CH4", "2050"] == 1800.0
+    # HFC125 (compact CICERO form) -> HFC-125 (FaIR form).
+    assert by_var.loc["HFC-125", "2050"] == 70.0
+
+
+def test_build_concentrations_df_from_scmrun_empty_when_no_concs():
+    # ScmRun with only Emissions rows -> empty DataFrame (no Atmospheric
+    # Concentrations to extract). Caller falls back to emissions-driven.
+    import pandas as pd
+    from scmdata import ScmRun
+
+    from openscm_runner.adapters.fair2_adapter._concentrations_translator import (
+        build_concentrations_df_from_scmrun,
+    )
+
+    df = pd.DataFrame([
+        {"model": "m", "scenario": "ssp245", "region": "World",
+         "variable": "Emissions|CO2|MAGICC Fossil and Industrial",
+         "unit": "Mt CO2/yr", "2020": 35000.0},
+    ])
+    run = ScmRun(df)
+    out = build_concentrations_df_from_scmrun(run, fair_species={"CO2", "CH4"})
+    assert out.empty
+
+
+def test_build_concentrations_df_from_scmrun_drops_unknown_species():
+    # Species not in fair_species are dropped silently.
+    import pandas as pd
+    from scmdata import ScmRun
+
+    from openscm_runner.adapters.fair2_adapter._concentrations_translator import (
+        build_concentrations_df_from_scmrun,
+    )
+
+    df = pd.DataFrame([
+        {"model": "m", "scenario": "esm-ssp245", "region": "World",
+         "variable": "Atmospheric Concentrations|CH4",
+         "unit": "ppb", "2020": 1900.0},
+        {"model": "m", "scenario": "esm-ssp245", "region": "World",
+         "variable": "Atmospheric Concentrations|Halon1202",
+         "unit": "ppt", "2020": 0.5},
+    ])
+    run = ScmRun(df)
+    out = build_concentrations_df_from_scmrun(
+        run, fair_species={"CH4"},  # Halon-1202 not in fair_species
+    )
+    assert out["variable"].tolist() == ["CH4"]

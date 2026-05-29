@@ -178,6 +178,63 @@ def build_concentrations_df(  # noqa: PLR0913
     return out
 
 
+def build_concentrations_df_from_scmrun(
+    scenario_run,
+    fair_species: Iterable[str],
+    nystart: int = 1750,
+    nyend: int = 2500,
+) -> pd.DataFrame:
+    """Build a FaIR-compatible concentrations DataFrame from a mixed-mode ScmRun.
+
+    The loader's protocol-strict ED CO2-only path
+    (``openscm_runner.scenarios.rcmip3._load_mixed_mode_scenario``)
+    emits a single ScmRun containing CO2 emissions plus non-CO2
+    Atmospheric Concentrations. This helper extracts the concentration
+    half and shapes it for :meth:`fair.FAIR.fill_from_pandas`
+    (``mode="concentration"``), mirroring :func:`build_concentrations_df`.
+
+    Variable names are translated from the loader's canonical
+    ``Atmospheric Concentrations|{species}`` form (CICERO-style short
+    species names like ``HFC125``) to FaIR's hyphenated species
+    (``HFC-125``) via the same :data:`CICERO_TO_FAIR2_SPECIES` map
+    the bundle path uses. Species not in ``fair_species`` are dropped.
+
+    Returns an empty DataFrame when the input has no
+    ``Atmospheric Concentrations|*`` rows — caller checks ``.empty``.
+    """
+    fair_species_set = set(fair_species)
+    conc_run = scenario_run.filter(variable="Atmospheric Concentrations|*")
+    if conc_run.empty:
+        return pd.DataFrame()
+
+    rows: list[dict] = []
+    ts = conc_run.timeseries(time_axis="year")
+    for index_tuple, values in ts.iterrows():
+        meta = dict(zip(ts.index.names, index_tuple))
+        variable = meta["variable"]
+        # variable is "Atmospheric Concentrations|<species>"; strip the prefix.
+        species_short = variable.split("|", 1)[1]
+        fair_name = CICERO_TO_FAIR2_SPECIES.get(species_short, species_short)
+        if fair_name not in fair_species_set:
+            continue
+        row = {
+            "scenario": meta.get("scenario"),
+            "variable": fair_name,
+            "region": meta.get("region", "World"),
+            "unit": meta.get("unit"),
+        }
+        for year, value in values.items():
+            if nystart <= int(year) <= nyend:
+                row[str(int(year))] = float(value)
+        rows.append(row)
+
+    if not rows:
+        return pd.DataFrame()
+    out = pd.DataFrame(rows)
+    out.columns = [c.lower() if not c.isdigit() else c for c in out.columns]
+    return out
+
+
 def _pick_conc_file(bundle_dir: str, scenario_name: str, gases_ep: str):
     """Scenario-specific bundle conc file, falling back to historical."""
     for candidate in (
