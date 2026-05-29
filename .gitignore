@@ -155,6 +155,9 @@ ENV/
 env.bak/
 venv.bak/
 venv3.bak/
+.venv*
+
+notebooks/figures
 
 # Spyder project settings
 .spyderproject
