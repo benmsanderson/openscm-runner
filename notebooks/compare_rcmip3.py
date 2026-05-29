@@ -398,7 +398,7 @@ def plot_flat_family():
                   label=f"{model} {base}")
     ax_zec.axvline(1850 + 100, color="black", lw=0.8, linestyle="-",
                    alpha=0.5, label="emissions stop")
-    ax_zec.set_xlim(1850, 2300)
+    ax_zec.set_xlim(1850, 2450)
     ax_zec.set_xlabel("Year")
     ax_zec.set_ylabel("GSAT (K)")
     ax_zec.set_title("Zero-emissions commitment after year 100")
