@@ -102,12 +102,20 @@ def test_resolve_scenarios_named_set_flat():
 def test_resolve_scenarios_named_set_all_covers_everything():
     args = runner._parse_args(["--scenario-set", "all"])
     resolved = runner._resolve_scenarios(args)
-    # 8 SSPs + 7 scen7 + 15 flat-* + 1 historical = 31
-    assert len(resolved) == 31
-    assert "ssp119" in resolved
-    assert "scen7-VL" in resolved
-    assert "esm-flat10-zec" in resolved
-    assert "historical" in resolved
+    # "all" is the union of every other named set (definition in
+    # scripts/run_rcmip3.py); check that invariant rather than a
+    # brittle hardcoded count.
+    expected = tuple(sorted(set().union(*(
+        v for k, v in runner._SCENARIO_SETS.items() if k != "all"
+    ))))
+    assert resolved == expected
+    # Representative spot checks across families (regression guard):
+    for s in (
+        "ssp119", "scen7-VL", "esm-flat10-zec", "historical",
+        "1pctCO2", "abrupt-4xCO2", "esm-ssp245", "esm-bell-1000PgC",
+        "piControl",
+    ):
+        assert s in resolved
 
 
 def test_resolve_scenarios_explicit_takes_precedence_only_if_other_unset():
