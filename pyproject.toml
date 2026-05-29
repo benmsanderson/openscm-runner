@@ -181,6 +181,13 @@ docstring-code-format = true
     "E402",  # Module level import not at top of file
     "S101",  # Use of `assert` detected
 ]
+"notebooks/*" = [
+    "D",     # Notebooks document themselves via markdown cells
+    "E402",  # Cells can set state (e.g. mp.set_start_method) before importing
+    "I",     # Cell-by-cell ordering of imports is intentional in notebooks
+    "S101",  # Notebook sanity checks use assert by design
+    "PLR2004",  # Bare numeric thresholds in sanity checks are intentional
+]
 "scripts/*" = [
     "S101" # S101 Use of `assert` detected
 ]
