@@ -120,6 +120,52 @@ def test_canonicalise_does_not_touch_non_emissions_variables():
     assert _canonicalise_variable(None) is None  # type: ignore[arg-type]
 
 
+def test_canonicalise_concentration_parent_paths():
+    # The RCMIP3 concentrations CSV uses the same F-Gases / HFC parent
+    # structure as the emissions CSV; same harmonisation rules apply.
+    assert (
+        _canonicalise_variable("Atmospheric Concentrations|F-Gases|HFC|HFC125")
+        == "Atmospheric Concentrations|HFC125"
+    )
+    assert (
+        _canonicalise_variable("Atmospheric Concentrations|F-Gases|PFC|CF4")
+        == "Atmospheric Concentrations|CF4"
+    )
+    assert (
+        _canonicalise_variable("Atmospheric Concentrations|Montreal Gases|CCl4")
+        == "Atmospheric Concentrations|CCl4"
+    )
+    # Bare ones pass through unchanged.
+    assert (
+        _canonicalise_variable("Atmospheric Concentrations|CO2")
+        == "Atmospheric Concentrations|CO2"
+    )
+    assert (
+        _canonicalise_variable("Atmospheric Concentrations|CH4")
+        == "Atmospheric Concentrations|CH4"
+    )
+
+
+def test_canonicalise_concentration_co2_is_not_sector_split():
+    # CO2 sector split rule is emissions-only (concentrations source
+    # only has a single ``Atmospheric Concentrations|CO2`` row).
+    assert (
+        _canonicalise_variable(
+            "Atmospheric Concentrations|CO2|MAGICC Fossil and Industrial"
+        )
+        == "Atmospheric Concentrations|CO2|MAGICC Fossil and Industrial"
+    )
+
+
+def test_canonical_variables_contains_emissions_and_concentrations():
+    # Both families have entries in the allowlist post-Phase-B-step-1.
+    assert "Emissions|CO2|MAGICC Fossil and Industrial" in CANONICAL_VARIABLES
+    assert "Atmospheric Concentrations|CO2" in CANONICAL_VARIABLES
+    assert "Atmospheric Concentrations|CH4" in CANONICAL_VARIABLES
+    assert "Atmospheric Concentrations|HFC125" in CANONICAL_VARIABLES
+    assert "Atmospheric Concentrations|CCl4" in CANONICAL_VARIABLES
+
+
 def test_load_iamc_csv_filters_to_world_and_canonical_allowlist(tmp_path):
     path = _write_csv(tmp_path, [
         _row(variable="Emissions|CH4", **{"2020": 300.0}),
@@ -197,10 +243,12 @@ def test_load_iamc_raises_when_filter_leaves_no_rows(tmp_path):
         load_iamc(path)
 
 
-def test_canonical_variables_matches_existing_rcmip_csv_set():
-    # Guard against drift: the loader's allowlist should equal the
-    # variable set in scripts/rcmip_scen_ssp_world_emissions.csv, which
-    # downstream tests already consume.
+def test_canonical_variables_covers_existing_rcmip_emissions_set():
+    # Guard against drift: every emissions variable in
+    # scripts/rcmip_scen_ssp_world_emissions.csv must still be in the
+    # allowlist (the allowlist may add concentrations entries beyond
+    # those, but it must never drop an emissions species the existing
+    # downstream tests depend on).
     rcmip_csv = (
         Path(__file__).parent.parent.parent
         / "scripts"
@@ -209,4 +257,5 @@ def test_canonical_variables_matches_existing_rcmip_csv_set():
     if not rcmip_csv.exists():
         pytest.skip("rcmip_scen_ssp_world_emissions.csv not present")
     rcmip_vars = set(pd.read_csv(rcmip_csv)["Variable"].unique())
-    assert rcmip_vars == set(CANONICAL_VARIABLES)
+    missing = rcmip_vars - set(CANONICAL_VARIABLES)
+    assert not missing, f"Emissions variables missing from allowlist: {missing}"
