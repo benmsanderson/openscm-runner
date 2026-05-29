@@ -54,9 +54,16 @@ pymagicc = { version = "<3", optional = true }
 notebook = { version = "*", optional = true }
 seaborn = { version = "^0.13.1", optional = true }
 ipywidgets = { version = "^8.1.1", optional = true }
+# netcdf4 powers `openscm_runner.output.NetCDFChunkWriter` and the
+# `scmdata.ScmRun.from_nc` read-back used by the comparison notebooks.
+# It is optional so a plain `pip install openscm-runner` stays light,
+# but anyone using the chunked output writer or the demo notebooks
+# needs it (selected via the `[netcdf]` or `[notebooks]` extras).
+netcdf4 = { version = ">=1.6", optional = true }
 
 [tool.poetry.extras]
-notebooks = ["notebook", "seaborn", "ipywidgets"]
+notebooks = ["notebook", "seaborn", "ipywidgets", "netcdf4"]
+netcdf = ["netcdf4"]    # Streaming-output / chunked-read support
 ciceroscmpy = ["ciceroscm"]
 fair = ["fair"]
 magicc = ["pymagicc"]
