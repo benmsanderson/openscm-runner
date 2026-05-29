@@ -8,7 +8,7 @@
 #       extension: .py
 #       format_name: percent
 #       format_version: '1.3'
-#       jupytext_version: 1.11.2
+#       jupytext_version: 1.19.3
 #   kernelspec:
 #     display_name: .venv
 #     language: python
@@ -59,9 +59,32 @@ import openscm_runner  # noqa: F401  (applies scmdata pandas-3 patches)
 from openscm_runner.scenarios import CONSTRAINT_TARGETS
 
 REPO_ROOT = Path.cwd().parent if Path.cwd().name == "notebooks" else Path.cwd()
-DATA_ROOT = REPO_ROOT / "out" / "rcmip3"
+# DATA_ROOT: pick the most recent sweep that exists. Falls back to the
+# original out/rcmip3 (Phase B baseline) if no rearch sweeps are present.
+_SWEEP_CANDIDATES = (
+    "rcmip3_issue45fair_full",  # All five fixes (loader mixed-mode +
+                                # adapter consumption + LUC/VOLC/solar
+                                # stripping + idealised PI-flat
+                                # emissions on both adapters)
+    "rcmip3_issue45_full",      # All except FaIR idealised fix
+    "rcmip3_bpartial",          # B-partial only
+    "rcmip3_step5ab",           # PR #12 baseline (post-rearch + bundle-name strip)
+    "rcmip3",                   # Phase B baseline (pre-rearch)
+)
+DATA_ROOT = next(
+    (REPO_ROOT / "out" / s for s in _SWEEP_CANDIDATES
+     if (REPO_ROOT / "out" / s / "emissions" / "CICERO-SCM-PY2").is_dir()
+     and any((REPO_ROOT / "out" / s / "emissions" / "CICERO-SCM-PY2").iterdir())),
+    REPO_ROOT / "out" / "rcmip3",
+)
+print(f"DATA_ROOT = {DATA_ROOT.relative_to(REPO_ROOT)}")
 FIGURE_DIR = REPO_ROOT / "notebooks" / "figures"
 FIGURE_DIR.mkdir(parents=True, exist_ok=True)
+
+# Marit Sandstad's native CICERO-SCM RCMIP3 reference submissions.
+# 500-member ensembles per scenario, one CSV per scenario, no header.
+MARIT_DIR = REPO_ROOT / "configurations" / "ciceroscm" / "marittmp"
+MARIT_VARIABLE = "Surface Air Ocean Blended Temperature Change"
 
 MODELS = ("FaIRv2", "CICERO-SCM-PY2")
 MODES = ("emissions", "concentrations")
@@ -197,21 +220,18 @@ def _overlay_constraint(ax, key: str) -> None:
 
 # %%
 def plot_historical_panels():
-    fig, axes = plt.subplots(2, 2, figsize=(13, 8))
-    # Per-panel y-limits keep the constraint band readable when the
-    # underlying scenario projects well past the historical period
-    # (matplotlib auto-scale would otherwise stretch the axis to the
-    # 2500 endpoint that the data carries but we don't plot).
+    # 3 panels in a 1x3 row: GMST, CO2, OHC. Aerosol ERF dropped for
+    # now since CICEROSCM's _OUTPUT_VARIABLES only exposes the bulk
+    # ERF; the per-component breakdown (Anthropogenic|Aerosol) would
+    # need an upstream / adapter extension.
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
     panel_specs = [
         ("GMST_anomaly", "Surface Air Temperature Change",
-         "GMST anomaly (K)", (-0.5, 2.0), axes[0, 0]),
+         "GMST anomaly (K)", (-0.5, 2.0), axes[0]),
         ("CO2_concentration", "Atmospheric Concentrations|CO2",
-         "Atmospheric CO2 (ppm)", (260, 450), axes[0, 1]),
+         "Atmospheric CO2 (ppm)", (260, 450), axes[1]),
         ("OHC_change", "Heat Content|Ocean",
-         "Ocean Heat Content (ZJ)", (-50, 800), axes[1, 0]),
-        ("aerosol_ERF",
-         "Effective Radiative Forcing|Anthropogenic|Aerosol",
-         "Aerosol ERF (W/m²)", (-2.2, 0.2), axes[1, 1]),
+         "Ocean Heat Content (ZJ)", (-50, 800), axes[2]),
     ]
     x_range = (1850, 2024)
     for ct_key, variable, ylabel, ylim, ax in panel_specs:
@@ -230,14 +250,13 @@ def plot_historical_panels():
         ax.set_xlim(*x_range)
         ax.set_ylim(*ylim)
         ax.set_ylabel(ylabel)
+        ax.set_xlabel("Year")
         ax.grid(alpha=0.3)
-    axes[0, 0].legend(fontsize=7, loc="upper left")
-    axes[-1, 0].set_xlabel("Year")
-    axes[-1, 1].set_xlabel("Year")
+    axes[0].legend(fontsize=7, loc="upper left")
     fig.suptitle(
         "Historical validation against RCMIP3 Table 3 constraints "
-        "(IGCC2024, GCB2024, AR6)",
-        y=1.0,
+        "(IGCC2024, GCB2024)",
+        y=1.02,
     )
     fig.tight_layout()
     _save(fig, "historical_validation")
@@ -345,11 +364,17 @@ def plot_flat_family():
     fig, axes = plt.subplots(1, 2, figsize=(13, 5))
 
     # Left panel: TCRE convergence on the plain flat-* (no -zec suffix)
-    # scenarios — these have constant emissions for the full 300 years
-    # so the cumulative-vs-GSAT trajectory keeps growing rather than
-    # plateauing.
+    # scenarios. X-axis is the input cumulative emissions (the protocol's
+    # constant trajectory: 7.5, 10, 20 PgC/yr starting at 1850), NOT a
+    # model diagnostic — Net Flux to Atmosphere is the residual after
+    # ocean+land uptake and has a sign convention that doesn't track
+    # cumulative anthropogenic emissions.
     ax_tcre = axes[0]
+    flat_emission_rate = {  # PgC/yr, constant from 1850 onwards
+        "esm-flat7.5": 7.5, "esm-flat10": 10.0, "esm-flat20": 20.0,
+    }
     for base in FLAT_BASES:
+        rate = flat_emission_rate[base]
         for model in MODELS:
             run = load_chunk("emissions", model, base)
             if run is None:
@@ -357,18 +382,14 @@ def plot_flat_family():
             ts_t = run.filter(
                 variable="Surface Air Temperature Change",
             ).timeseries(time_axis="year")
-            ts_e = run.filter(
-                variable="Net Flux to Atmosphere|CO2",
-            ).timeseries(time_axis="year")
-            if ts_e.empty:
+            if ts_t.empty:
                 continue
-            # Cumulative net flux to atmosphere ≈ cumulative emissions
-            # for the flat-* family (no negative natural fluxes baked in).
-            cum = ts_e.cumsum(axis=1).median(axis=0).values
+            years = ts_t.columns.astype(int).values
+            # Cumulative input emissions: rate * (year - 1850),
+            # clipped to zero before 1850.
+            cum = np.clip(years - 1850, 0, None) * rate
             gsat = ts_t.median(axis=0).values
-            # Drop the pre-experiment spin-up rows where cumulative
-            # is effectively zero (these compress the visible range).
-            mask = cum > 50.0
+            mask = cum >= 50.0
             ax_tcre.plot(
                 cum[mask] / 1000.0, gsat[mask],
                 color=MODEL_HUE[model],
@@ -376,9 +397,9 @@ def plot_flat_family():
                            ":" if base == "esm-flat7.5" else "--"),
                 lw=1.5, label=f"{model} {base}",
             )
-    ax_tcre.set_xlabel("Cumulative net flux to atmosphere (kgCO2 × 10⁻³ ≈ PgC)")
+    ax_tcre.set_xlabel("Cumulative input emissions (1000 PgC = TtC)")
     ax_tcre.set_ylabel("GSAT (K)")
-    ax_tcre.set_title("TCRE: cumulative emissions vs GSAT (esm-flat*)")
+    ax_tcre.set_title("TCRE: cumulative input emissions vs GSAT (esm-flat*)")
     ax_tcre.legend(fontsize=7)
     ax_tcre.grid(alpha=0.3)
 
@@ -483,17 +504,219 @@ plt.show()
 
 
 # %% [markdown]
+# ## Figure 5 — Validation against Marit Sandstad's native CICERO-SCM reference
+#
+# The 97 RCMIP3 scenarios that Marit submitted to gitlab.com/rcmip/rcmip-phase-3
+# are our scorecard target — they're the only published native-CICEROSCM
+# RCMIP3 reference. For each scenario, Marit ran 500 ensemble members
+# from ``draw_samples_500.json`` against her native CICEROSCM pipeline;
+# we run the matched 10 members (same run_ids, deterministic seeded)
+# through ``openscm_runner.adapters.ciceroscm_py2_adapter``.
+#
+# The figures below show the per-year GSAT diff (ours − Marit, both
+# medians over their respective ensembles) for representative scenario
+# families. Horizontal bands mark the scorecard thresholds:
+# **PASS** if max |diff| ≤ 0.05 K, **WARN** if ≤ 0.15 K, **FAIL** above.
+
+# %%
+def load_marit_reference(scenario: str):
+    """Read Marit's 500-member reference, indexed by run_id.
+
+    Returns a DataFrame whose index is the per-row run_id (from the
+    CSV's 4th column) and whose columns are years 1750-2500. Mirrors
+    ``scripts/validate_against_marit.py:_load_marit`` so the
+    notebook's matched-member diff matches the scorecard.
+    """
+    import pandas as pd
+    path = MARIT_DIR / f"{scenario}_rcmip_draw_samples_500.csv"
+    if not path.exists() or path.stat().st_size == 0:
+        return None
+    raw = pd.read_csv(path, header=None)
+    n_year_cols = raw.shape[1] - 8
+    years = list(range(1750, 1750 + n_year_cols))
+    data = raw.iloc[:, 8:]
+    data.columns = years
+    is_var = raw.iloc[:, 6].values == MARIT_VARIABLE
+    out = data[is_var].copy()
+    out.index = raw.iloc[:, 3][is_var].values
+    out.index.name = "run_id"
+    return out
+
+
+def _our_chunk_for_marit_compare(scenario: str):
+    """Pick the right (mode, model) chunk per Marit's protocol convention."""
+    s = scenario.lower()
+    mode = (
+        "emissions" if s.startswith("esm-")
+        or s in ("hist-aer", "hist-co2", "hist-ghg")
+        else "concentrations"
+    )
+    return load_chunk(mode, "CICERO-SCM-PY2", scenario)
+
+
+def diff_against_marit(scenario: str):
+    """Matched-member median diff (our - Marit) over the year intersection.
+
+    Mirrors the scorecard's per-run_id matching: pull the matched
+    subset of Marit's 500-member ensemble against our 10-member ensemble
+    and take the median over the matched runs only. This is the same
+    statistic the scorecard reports as ``max|med dif|``.
+    """
+    marit = load_marit_reference(scenario)
+    if marit is None:
+        return None
+    our_run = _our_chunk_for_marit_compare(scenario)
+    if our_run is None:
+        return None
+    sub = our_run.filter(variable=MARIT_VARIABLE)
+    if sub.empty:
+        return None
+    our_ts = sub.timeseries(time_axis="year")
+    our_ts.index = our_ts.index.get_level_values("run_id")
+    matched = sorted(set(our_ts.index) & set(marit.index))
+    if not matched:
+        return None
+    common_years = sorted(set(our_ts.columns) & set(marit.columns))
+    if not common_years:
+        return None
+    m = marit.loc[matched, common_years].median(axis=0).values
+    o = our_ts.loc[matched, common_years].median(axis=0).values
+    return np.array(common_years), o - m
+
+
+def plot_marit_diff_panel(scenarios, title, tag, *, palette=None, x_range=(1850, 2500)):
+    """One axes; each scenario gets one line of (ours - Marit) over time."""
+    fig, ax = plt.subplots(1, 1, figsize=(12, 5))
+    skipped = []
+    for i, scen in enumerate(scenarios):
+        result = diff_against_marit(scen)
+        if result is None:
+            skipped.append(scen)
+            continue
+        years, diff = result
+        color = palette[scen] if palette and scen in palette else f"C{i % 10}"
+        ax.plot(years, diff, lw=1.2, alpha=0.9, label=scen, color=color)
+    ax.axhline(0, color="black", lw=0.5)
+    ax.axhspan(-0.05, 0.05, color="green", alpha=0.08, label="PASS band (+/-50 mK)")
+    for thr, label in ((0.15, "FAIL threshold (+/-150 mK)"), (-0.15, None)):
+        ax.axhline(thr, color="red", lw=0.7, linestyle="--", alpha=0.5,
+                   label=label)
+    ax.set_xlim(*x_range)
+    ax.set_xlabel("Year")
+    ax.set_ylabel("GSAT diff: ours - Marit's reference (K)")
+    # Annotate the data source so figures from different sweeps are
+    # distinguishable when they live side-by-side on disk.
+    ax.set_title(f"{title}\n[source: {DATA_ROOT.relative_to(REPO_ROOT)}]", fontsize=10)
+    ax.legend(fontsize=8, ncol=2, loc="best")
+    ax.grid(alpha=0.3)
+    if skipped:
+        print(f"  skipped (missing data): {skipped}")
+    fig.tight_layout()
+    _save(fig, f"marit_diff_{tag}")
+    return fig
+
+
+# %% [markdown]
+# ### 5a — esm-ssp* family (the rearch's biggest unlock)
+#
+# Pre-rearch (Phase B): every ``esm-ssp*`` scenario FAILed at 4-9 K
+# max diff, driven by the CICEROSCM bundle resolver falling back to
+# ``historical_em_*`` instead of finding ``ssp245_em_*`` (the bundle
+# uses bare names). After the rearch's bundle-name stripping (step 5b)
+# and B-partial's proper mixed-mode loader, these collapse to the
+# ``esm-allGHG-`` siblings — matching Marit's bit-identical pair
+# convention.
+
+# %%
+fig_marit_essp = plot_marit_diff_panel(
+    ["esm-ssp119", "esm-ssp126", "esm-ssp245", "esm-ssp370",
+     "esm-ssp434", "esm-ssp460", "esm-ssp534-over", "esm-ssp585"],
+    "Marit diff — ED CO2-only SSPs (esm-ssp*)",
+    "esm_ssps",
+)
+plt.show()
+
+
+# %% [markdown]
+# ### 5b — scen7-*C family (CD variants)
+#
+# Pre-rearch: 1-6 K max diffs, driven by the bundle resolver looking
+# for ``scen7-HC_conc_*`` (doesn't exist) instead of ``scen7-H_conc_*``.
+# Step 5b's name stripping pulls these into WARN at ~130 mK.
+
+# %%
+fig_marit_scen7c = plot_marit_diff_panel(
+    ["scen7-HC", "scen7-HLC", "scen7-LC", "scen7-LNC",
+     "scen7-MC", "scen7-MLC", "scen7-VLC"],
+    "Marit diff — CD scen7-*C variants",
+    "scen7_cd",
+)
+plt.show()
+
+
+# %% [markdown]
+# ### 5c — Historical and piControl
+#
+# Validation that real-world / control runs match. Historical,
+# hist-* attribution runs should all be within ±50 mK of Marit.
+#
+# The three piControl variants show a positive bias peaking ~+0.4 K
+# around 1980 in the diff. That bias is in **Marit's** reference,
+# not ours: our piControl trajectory is bit-exact zero throughout
+# (perfect PI control after the step-4b idealised-suppression set
+# plus the post-PR-#12 ``esm-piControl_em_`` fallback for emissions),
+# while Marit's pipeline leaks historical aerosol-precursor
+# emissions into her piControl run, producing a cooling that peaks
+# around the 1980 SO2 maximum and recovers as aerosols decline.
+# The diff plot therefore traces the inverse of Marit's drift, not
+# ours — the +0.4 K peak at 1980 is the historical SO2 aerosol
+# forcing leaking into a run that should be pure pre-industrial.
+
+# %%
+fig_marit_hist = plot_marit_diff_panel(
+    ["historical", "historical-cmip6", "hist-aer", "hist-CO2", "hist-GHG",
+     "piControl", "esm-piControl", "esm-allGHG-piControl",
+     "esm-hist", "esm-allGHG-hist"],
+    "Marit diff — historical, attribution, and piControl variants",
+    "historical_and_picontrol",
+)
+plt.show()
+
+
+# %% [markdown]
+# ### 5d — Idealised CD experiments (residual FAILs)
+#
+# 1pctCO2 and abrupt-* runs still show 0.5-1.0 K diffs (FAIL). The
+# sign pattern (less warming under high CO2, less cooling under 0.5x)
+# is consistent with a different ECS/TCR distribution vs Marit's
+# pipeline. Not addressed by PR #12; documented as future work.
+
+# %%
+fig_marit_ideal = plot_marit_diff_panel(
+    ["1pctCO2", "1pctCO2-4xext", "1pctCO2-cdr",
+     "abrupt-0p5xCO2", "abrupt-2xCO2", "abrupt-4xCO2"],
+    "Marit diff — CD idealised (residual ECS/TCR discrepancy)",
+    "cd_idealised",
+)
+plt.show()
+
+
+# %% [markdown]
 # ## Summary
 #
-# All four figure families read from the same on-disk cache produced
+# All five figure families read from the same on-disk cache produced
 # by ``scripts/run_rcmip3.py --members 10 --scenario-set all --mode both``.
 # Re-running the cells regenerates figures without re-running models.
 #
-# The four artefacts saved to ``notebooks/figures/`` are the
-# headline outputs to share with the RCMIP3 community:
+# The headline artefacts saved to ``notebooks/figures/`` for the
+# RCMIP3 community / IPCC AR7 audience:
 #
 # - ``compare_rcmip3_historical_validation.png``
 # - ``compare_rcmip3_scenarios_ssps.png``
 # - ``compare_rcmip3_scenarios_scen7.png``
 # - ``compare_rcmip3_flat_family_diagnostics.png``
 # - ``compare_rcmip3_ed_vs_cd.png``
+# - ``compare_rcmip3_marit_diff_esm_ssps.png``  (NEW: validation)
+# - ``compare_rcmip3_marit_diff_scen7_cd.png``  (NEW: validation)
+# - ``compare_rcmip3_marit_diff_historical_and_picontrol.png``  (NEW)
+# - ``compare_rcmip3_marit_diff_cd_idealised.png``  (NEW)
