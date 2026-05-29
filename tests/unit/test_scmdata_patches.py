@@ -51,7 +51,10 @@ def test_groupby_does_not_crash_on_stringdtype_meta(small_scmrun):
     # column dtype, which raised TypeError. After the patch the call
     # routes through pd.api.types.is_numeric_dtype and runs cleanly.
     grouped = list(small_scmrun.groupby("scenario"))
-    assert sorted(g.get_unique_meta("scenario", no_duplicates=True) for g in grouped) == ["A", "B"]
+    scenarios = sorted(
+        g.get_unique_meta("scenario", no_duplicates=True) for g in grouped
+    )
+    assert scenarios == ["A", "B"]
 
 
 def test_to_xarray_does_not_crash_on_series_positional_indexing(small_scmrun):
@@ -63,6 +66,30 @@ def test_to_xarray_does_not_crash_on_series_positional_indexing(small_scmrun):
     # and that the data is roundtrippable in essentials.
     assert "Emissions|CO2" in ds.data_vars
     assert "Emissions|CH4" in ds.data_vars
+
+
+def test_convert_unit_does_not_crash_on_readonly_values(small_scmrun):
+    # The bug: ScmRun.convert_unit's inner apply_units closure did
+    # group._df.values[:] = ... which raises ValueError in pandas 3.0
+    # because DataFrame.values always returns a read-only array.
+    # After the patch the closure uses group._df.iloc[:, :] = ... instead.
+    converted = small_scmrun.filter(variable="Emissions|CO2").convert_unit("Mt CO2/yr")
+    assert converted.get_unique_meta("unit", no_duplicates=True) == "Mt CO2/yr"
+
+
+def test_from_nc_does_not_warn_on_deprecated_use_cftime(tmp_path, small_scmrun):
+    # The bug: scmdata.netcdf._read_nc passes ``use_cftime=True`` to
+    # xr.load_dataset, which xarray 2025+ flags as deprecated. The
+    # warning fires on every ScmRun.from_nc() call and floods the
+    # comparison-notebook output. After the patch, _read_nc routes
+    # through xarray.coders.CFDatetimeCoder.
+    import warnings
+    path = tmp_path / "round_trip.nc"
+    small_scmrun.to_nc(path, dimensions=("scenario",))
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", FutureWarning)
+        loaded = type(small_scmrun).from_nc(path)
+    assert sorted(loaded["scenario"].unique()) == ["A", "B"]
 
 
 def test_groupby_still_detects_numeric_columns_after_patch():
