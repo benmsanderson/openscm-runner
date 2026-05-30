@@ -2,8 +2,9 @@
 
 How the modernisation fork at `benmsanderson/openscm-runner` will land at
 upstream `openscm/openscm-runner`. Written for review by Zeb (upstream
-historical lead), Marit, and anyone else looking at the fork before the
-PRs open.
+historical lead) and Marit (CICERO-SCM 2.x lead, owner of the
+calibration bundle the CICEROSCMPY2 adapter is wired to), and anyone
+else looking at the fork before the PRs open.
 
 ## Background
 
@@ -111,9 +112,9 @@ def test_adapter_ssp245_smoke(adapter, conc_driven):
     # variables present, 2100 GSAT in plausible band, no NaNs
 ```
 
-Skipped automatically when `FAIR2_CALIBRATION_PATH` /
-`CICEROSCMPY2_BUNDLE_DIR` aren't set so upstream CI doesn't need bundle
-access. Optional fifth case: both adapters in one `run.run` call.
+CI runs both bundles for real (see "CI coverage" below); the skip
+guards only fire on contributor machines where the env vars aren't
+set. Optional fifth case: both adapters in one `run.run` call.
 
 Files we drop from the upstream PR (kept on the fork's feature branches
 for our own iteration):
@@ -153,6 +154,28 @@ current `fair`. The plan:
 We'd ask Zeb for push access to OMS-NetZero/FAIR if we need to commit
 fixes to the v1.6.2-gcages branch directly.
 
+## CI coverage
+
+The four parameterised tests need bundles to do anything useful. The
+existing upstream convention is to skip when env vars are absent, which
+silently hides coverage gaps. We'd rather have CI exercise the new
+adapters end-to-end:
+
+- **FaIRv2**: the calibration CSVs (~2 MB) are already published on
+  Zenodo (record `18828694`). `scripts/download_fair2_calibration.py`
+  is in the fork; we wire it into the CI workflow and set
+  `FAIR2_CALIBRATION_PATH` from the cached path.
+- **CICERO-SCM-PY2**: the `rcmip-march2026` bundle Marit produced is
+  what these tests need. It's not on Zenodo yet. **Ask for Marit**:
+  publish it (or a CI-sized 10-member subset) under a citable DOI so
+  the CI workflow can fetch + cache it the same way we fetch the FaIRv2
+  bundle. Once that's available, CI sets `CICEROSCMPY2_BUNDLE_DIR` from
+  the cache path and the four tests all run for real.
+
+The CI workflow change goes in PR B alongside the test file; both
+bundle downloads are cached by hash of the upstream record so the cost
+is one fetch per cache miss.
+
 ## What we're not bringing upstream
 
 Out of scope for these PRs, kept on the fork for our own use:
@@ -171,17 +194,29 @@ Out of scope for these PRs, kept on the fork for our own use:
 - The SCI integration story (Zeb pointed us at `gcages` for that; we'd
   pick it up in a follow-up once these PRs are in).
 
-## Open questions to confirm with Zeb
+## Resolved (decisions, not questions)
 
-1. Cutting an scmdata release after PR A merges: roughly what cadence
-   should we plan for? PR B's pin depends on a tagged scmdata version.
-2. Drop `validate_against_marit.py` and `compare_flat10_zec_marit.py`
-   from PR B, or keep them as `scripts/` debugging utilities? Currently
-   leaning drop.
-3. Drop `PHASE_B_SCORECARD.md` from PR B (it's a fork-internal status
-   doc)? Currently leaning drop.
-4. Want a 30-minute call before we open the PRs to walk through the
-   adapter surfaces? Voice-only fine.
+- **Sequencing**: 2-shot. PR A (scmdata) lands and gets tagged first;
+  PR B opens against `openscm/openscm-runner@main` once that pin is
+  available, with the in-tree shim removed.
+- **Marit-specific tests, scorecard, validation scripts**: stay on the
+  fork. `PHASE_B_SCORECARD.md`, `validate_against_marit.py`,
+  `compare_flat10_zec_marit.py` and the ~99 fork-only unit tests for
+  the new adapters all live on `modernisation/integration` and its
+  feature branches; upstream only sees source + the four parameterised
+  integration tests.
+
+## CICERO-SCM needs
+
+
+1. Can we publish the `rcmip-march2026` CICERO-SCM calibration bundle
+   to Zenodo under a citable DOI? A CI-sized subset (10 members) is
+   fine if the full ensemble is awkward to host. Without it the
+   upstream CI either skips the CICERO tests entirely or relies on a
+   path we ship in-tree, neither of which is great.
+2. Same question for any future bundle revisions: ideally each version
+   we calibrate against gets its own DOI so the runner can pin to a
+   known artefact rather than a mutable directory.
 
 ## Verification
 
