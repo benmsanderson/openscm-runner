@@ -34,32 +34,31 @@ backport ceremony.
 
 ## Two PRs against `openscm/openscm-runner@main`
 
-### PR A: scmdata pandas-3 / xarray-2025+ compatibility shim
+### PR A: pandas-3 / xarray-2025+ fixes against `openscm/scmdata`
 
-Four patches against scmdata, applied at openscm-runner import time so
-the fix is local until scmdata ships a release:
+Four fixes to the affected scmdata source files (not a shim in
+openscm-runner). Zeb maintains both repos and our last scmdata PRs
+merged quickly, so the proper fix at the source goes in the same FOD
+window. Once a scmdata release is cut, openscm-runner just pins to
+the fixed version and the in-tree shim is deleted as part of PR B.
 
-1. `scmdata.groupby.RunGroupBy.__init__` — replace
-   `np.issubdtype(col.dtype, np.number)` with
-   `pd.api.types.is_numeric_dtype(col)` (StringDtype no longer crashes
-   the numeric-column detection).
-2. `scmdata._xarray._many_to_one` — replace `.max()[0]` with
-   `.max().iloc[0]` (positional Series indexing was removed in pandas 3).
-3. `scmdata.run.ScmRun.convert_unit` — replace
-   `group._df.values[:] = ...` with `group._df.iloc[:, :] = ...`
-   (`DataFrame.values` returns a read-only array in pandas 3).
-4. `scmdata.netcdf._read_nc` — replace
-   `xr.load_dataset(fname, use_cftime=True)` with
-   `xr.load_dataset(fname, decode_times=CFDatetimeCoder(use_cftime=True))`
-   (silences the FutureWarning xarray 2025+ emits on every
-   `ScmRun.from_nc` call).
+| Patch | scmdata file | Change |
+|---|---|---|
+| 1 | `scmdata/groupby.py` (`RunGroupBy.__init__`) | Replace `np.issubdtype(col.dtype, np.number)` with `pd.api.types.is_numeric_dtype(col)` so StringDtype meta columns don't trip the numeric-column detection |
+| 2 | `scmdata/_xarray.py` (`_many_to_one`) | Replace `.max()[0]` with `.max().iloc[0]` (pandas 3 removed positional indexing on label-indexed Series) |
+| 3 | `scmdata/run.py` (`ScmRun.convert_unit`) | Replace `group._df.values[:] = ...` with `group._df.iloc[:, :] = ...` since `DataFrame.values` is read-only in pandas 3 |
+| 4 | `scmdata/netcdf.py` (`_read_nc`) | Replace `xr.load_dataset(fname, use_cftime=True)` with `xr.load_dataset(fname, decode_times=CFDatetimeCoder(use_cftime=True))` to silence the FutureWarning xarray 2025+ emits on every `ScmRun.from_nc` call |
 
-Files: `src/openscm_runner/_scmdata_patches.py` plus the import-time call
-in `src/openscm_runner/__init__.py`. Tests:
-`tests/unit/test_scmdata_patches.py` (6 tests covering each patch's
-behaviour). Default target: keep as in-tree shim in openscm-runner per
-Zeb's "go crazy on scmdata" sign-off; can rebuild as a PR against
-openscm/scmdata if that's preferred.
+Tests for each patch land in scmdata's own test suite alongside the
+fixes (4-6 tests covering the broken cases). The shim and its tests
+currently in this repo (`src/openscm_runner/_scmdata_patches.py`,
+`tests/unit/test_scmdata_patches.py`, the import-time call in
+`src/openscm_runner/__init__.py`) are deleted in PR B; the runner's
+pyproject pins `scmdata>=<fixed-release>`.
+
+**Sequencing**: open PR A first; Zeb merges + cuts a scmdata release;
+open PR B against `openscm/openscm-runner@main` with the new scmdata
+pin and the shim removed.
 
 ### PR B: everything else
 
@@ -125,7 +124,8 @@ for our own iteration):
 - `tests/unit/test_rcmip3.py` (40 tests)
 - `tests/unit/test_run_rcmip3_script.py` (14 tests)
 - `tests/unit/test_output.py` NetCDFChunkWriter cases (~7 tests)
-- `tests/unit/test_scmdata_patches.py` (6 tests) — these live in PR A
+- `tests/unit/test_scmdata_patches.py` (6 tests) — patches move to scmdata in PR A; the shim and its tests are deleted entirely
+- `src/openscm_runner/_scmdata_patches.py` and its import-time call in `src/openscm_runner/__init__.py` (the shim itself) — deleted in PR B once scmdata releases the fix
 - `PHASE_B_SCORECARD.md`, `ARCHITECTURE_NOTES.md`, this file
 - `notebooks/figures/*` (gitignored; PNGs don't ship)
 - Fork-specific README sections
@@ -173,8 +173,8 @@ Out of scope for these PRs, kept on the fork for our own use:
 
 ## Open questions to confirm with Zeb
 
-1. PR A target: in-tree shim in openscm-runner, or open against
-   openscm/scmdata directly? We're proposing in-tree for speed.
+1. Cutting an scmdata release after PR A merges: roughly what cadence
+   should we plan for? PR B's pin depends on a tagged scmdata version.
 2. Drop `validate_against_marit.py` and `compare_flat10_zec_marit.py`
    from PR B, or keep them as `scripts/` debugging utilities? Currently
    leaning drop.
@@ -204,8 +204,9 @@ scripts/run_rcmip3.py --members 2 --scenarios ssp245 --mode both
 Then push, open PR, watch CI. Apply the FaIR 1.6 fallback per the
 section above if needed.
 
-For PR A standalone:
+For PR A standalone (against `openscm/scmdata`):
 
 ```bash
-pytest tests/unit/test_scmdata_patches.py -v   # 6 tests
+# In the scmdata checkout, after applying the four fixes
+pytest tests/ -v   # existing scmdata tests stay green + new patch tests pass
 ```
