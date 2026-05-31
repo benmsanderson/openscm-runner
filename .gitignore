@@ -155,6 +155,9 @@ ENV/
 env.bak/
 venv.bak/
 venv3.bak/
+.venv*
+
+notebooks/figures
 
 # Spyder project settings
 .spyderproject
@@ -179,3 +182,10 @@ dmypy.json
 
 # Swap files
 *.swp
+
+configurations/
+scenario_data/
+
+# RCMIP3 runner cache (per-(mode, model, scenario) netCDF chunks).
+# Regenerate via `scripts/run_rcmip3.py --scenario-set all --mode both`.
+out/

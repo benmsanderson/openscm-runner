@@ -12,9 +12,13 @@ files.
 """
 
 
+import logging
+import multiprocessing
 import os
 
 from dotenv import dotenv_values, find_dotenv
+
+LOGGER = logging.getLogger(__name__)
 
 
 class ConfigLoader:
@@ -137,3 +141,54 @@ class ConfigLoader:
 
 
 config = ConfigLoader()
+
+
+def get_worker_count(override_env_var):
+    """
+    Resolve the number of worker processes to use, accounting for cluster
+    CPU allocations.
+
+    Lookup order:
+
+    1. The adapter-specific override (``override_env_var``), e.g.
+       ``"FAIR_WORKER_NUMBER"``. Read via the shared :data:`config`
+       loader so it can come from either the environment or a dotenv
+       file. If set, returned as-is; users keep full control.
+    2. ``SLURM_CPUS_PER_TASK`` if set in the environment (SLURM exports
+       this for the current job allocation, so it reflects what the
+       scheduler actually gave us rather than the whole physical node).
+    3. ``OMP_NUM_THREADS`` if set (general-purpose thread-count hint).
+    4. :func:`multiprocessing.cpu_count` as a final fallback (entire
+       host, the pre-existing default).
+
+    Note that when top-level ``parallel_models`` dispatch is active in
+    :func:`openscm_runner.run.run`, multiple adapters may each spawn a
+    pool of this size concurrently. To avoid oversubscription on a
+    shared node, set the adapter-specific override env vars (e.g.
+    ``FAIR_WORKER_NUMBER``, ``MAGICC_WORKER_NUMBER``,
+    ``CICEROSCM_WORKER_NUMBER``) so the aggregate fits the allocation.
+
+    Parameters
+    ----------
+    override_env_var : str
+        Name of the adapter-specific override env var, e.g.
+        ``"FAIR_WORKER_NUMBER"``.
+
+    Returns
+    -------
+    int
+        Worker count to use, always at least 1.
+    """
+    for env_var in (override_env_var, "SLURM_CPUS_PER_TASK", "OMP_NUM_THREADS"):
+        value = config.get(env_var)
+        if value is None:
+            continue
+        try:
+            count = int(value)
+        except (TypeError, ValueError):
+            LOGGER.warning(
+                "Ignoring non-integer worker count from %s: %r", env_var, value
+            )
+            continue
+        return max(count, 1)
+    return multiprocessing.cpu_count()
